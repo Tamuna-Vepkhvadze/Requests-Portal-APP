@@ -681,6 +681,166 @@ function ConfirmDialog({ text, onConfirm, onCancel }) {
   );
 }
 
+
+/* ================================================================== */
+/*  🎨 CUSTOM MODALS FOR BACKUP                                       */
+/* ================================================================== */
+
+function PasswordPromptModal({ title, message, onConfirm, onCancel, confirmText = "დადასტურება", minLength = 8 }) {
+  const [password, setPassword] = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [error, setError] = useState("");
+  const inputRef = useRef(null);
+  
+  useEffect(() => {
+    setTimeout(() => inputRef.current?.focus(), 100);
+  }, []);
+  
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    
+    if (!password) {
+      setError("პაროლი სავალდებულოა");
+      return;
+    }
+    
+    if (password.length < minLength) {
+      setError(`პაროლი უნდა იყოს მინიმუმ ${minLength} სიმბოლო`);
+      return;
+    }
+    
+    onConfirm(password);
+  };
+  
+  return React.createElement(Modal, { title, onClose: onCancel },
+    React.createElement("form", { onSubmit: handleSubmit, className: "flex flex-col gap-4" },
+      message && React.createElement("p", { className: "text-sm text-[#3A3A32]" }, message),
+      
+      React.createElement(Field, { label: "პაროლი" },
+        React.createElement("div", { className: "relative" },
+          React.createElement("input", {
+            ref: inputRef,
+            type: showPw ? "text" : "password",
+            className: inputCls + " pr-9",
+            value: password,
+            onChange: e => {
+              setError("");
+              setPassword(e.target.value);
+            },
+            placeholder: `მინიმუმ ${minLength} სიმბოლო`
+          }),
+          React.createElement("button", {
+            type: "button",
+            onClick: () => setShowPw(!showPw),
+            className: "absolute right-2 top-1/2 -translate-y-1/2 text-[#9A967F] hover:text-[#16213E]",
+            tabIndex: -1
+          }, showPw
+            ? React.createElement(Icon, { name: "visibility_off", size: 15 })
+            : React.createElement(Icon, { name: "visibility", size: 15 })
+          )
+        )
+      ),
+      
+      error && React.createElement("div", {
+        className: "bg-[#F6E4E1] border border-[#F0999B] rounded-md px-3 py-2 text-xs text-[#C0392B] flex gap-2"
+      },
+        React.createElement(Icon, { name: "error", size: 14, className: "shrink-0" }),
+        React.createElement("span", null, error)
+      ),
+      
+      React.createElement("div", { className: "flex justify-end gap-2 mt-2" },
+        React.createElement("button", {
+          type: "button",
+          onClick: onCancel,
+          className: "px-4 py-2 rounded-md text-sm font-semibold text-[#6B6A5C] hover:bg-[#EFEDE2]"
+        }, "გაუქმება"),
+        React.createElement("button", {
+          type: "submit",
+          className: "px-4 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057] flex items-center gap-1.5"
+        },
+          React.createElement(Icon, { name: "lock", size: 15 }),
+          confirmText
+        )
+      )
+    )
+  );
+}
+
+function ConfirmModalCustom({ title, message, details, onConfirm, onCancel, confirmText = "დადასტურება", confirmStyle = "primary", icon = "help_outline" }) {
+  const confirmClass = confirmStyle === "danger"
+    ? "bg-[#C0392B] text-white hover:bg-[#a5312a]"
+    : "bg-[#16213E] text-white hover:bg-[#223057]";
+  
+  return React.createElement(Modal, { title, onClose: onCancel },
+    React.createElement("div", { className: "flex flex-col gap-4" },
+      React.createElement("div", { className: "flex gap-3 items-start" },
+        React.createElement(Icon, {
+          name: icon,
+          size: 24,
+          className: confirmStyle === "danger" ? "text-[#C0392B]" : "text-[#B8860B]"
+        }),
+        React.createElement("div", { className: "flex-1" },
+          React.createElement("p", { className: "text-sm text-[#3A3A32] mb-2" }, message),
+          details && React.createElement("div", {
+            className: "bg-[#FBF9F3] border border-[#E4E1D6] rounded-md p-3 text-xs text-[#6B6A5C]"
+          }, details)
+        )
+      ),
+      
+      React.createElement("div", { className: "flex justify-end gap-2" },
+        React.createElement("button", {
+          onClick: onCancel,
+          className: "px-4 py-2 rounded-md text-sm font-semibold text-[#6B6A5C] hover:bg-[#EFEDE2]"
+        }, "გაუქმება"),
+        React.createElement("button", {
+          onClick: onConfirm,
+          className: `px-4 py-2 rounded-md text-sm font-semibold ${confirmClass}`
+        }, confirmText)
+      )
+    )
+  );
+}
+
+function AlertModalCustom({ title, message, details, type = "info", onClose }) {
+  const colors = {
+    success: { bg: "#E4F1EA", border: "#1F6F50", text: "#1F6F50", icon: "check_circle" },
+    error: { bg: "#F6E4E1", border: "#C0392B", text: "#C0392B", icon: "error" },
+    warning: { bg: "#FBF1DA", border: "#B8860B", text: "#B8860B", icon: "warning" },
+    info: { bg: "#E6EBF4", border: "#2A4270", text: "#2A4270", icon: "info" }
+  };
+  
+  const style = colors[type] || colors.info;
+  
+  return React.createElement(Modal, { title, onClose },
+    React.createElement("div", { className: "flex flex-col gap-4" },
+      React.createElement("div", {
+        className: "rounded-md p-4 flex gap-3 items-start",
+        style: { background: style.bg, border: `1px solid ${style.border}` }
+      },
+        React.createElement(Icon, {
+          name: style.icon,
+          size: 24,
+          style: { color: style.text }
+        }),
+        React.createElement("div", { className: "flex-1" },
+          React.createElement("p", {
+            className: "text-sm font-semibold mb-2",
+            style: { color: style.text }
+          }, message),
+          details && React.createElement("div", { className: "text-xs opacity-90" }, details)
+        )
+      ),
+      
+      React.createElement("div", { className: "flex justify-end" },
+        React.createElement("button", {
+          onClick: onClose,
+          className: "px-4 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057]"
+        }, "კარგი")
+      )
+    )
+  );
+}
+
 /* ================================================================== */
 /*  🔐 REGISTRATION PAGE                                              */
 /* ================================================================== */
@@ -2537,8 +2697,14 @@ function ListEditor({ title, items, onAdd, onRemove, hint }) {
   );
 }
 
-function SettingsPage({ data, saveData }) {
+function SettingsPage({ data, saveData, onPlatformReset }) {
   const fileRef = useRef(null);
+  
+  // ✅ v2.0: Modal states
+  const [exportModal, setExportModal] = useState(null);
+  const [importModal, setImportModal] = useState(null);
+  const [alertModal, setAlertModal] = useState(null);
+  const [pendingImportFile, setPendingImportFile] = useState(null);
   
   const update = (key, items) => saveData({ ...data, [key]: items });
   
@@ -2551,32 +2717,17 @@ function SettingsPage({ data, saveData }) {
     { key: "auditResults", label: "აუდიტის შედეგი" }
   ];
   
-    const exportJson = async () => {
-    // ✅ v2.0: უსაფრთხო encrypted export only
-    const password = prompt(
-      "📦 Backup Export\n\n" +
-      "შეიყვანეთ პაროლი backup-ის დასაშიფრად:\n" +
-      "(რეკომენდაცია: გამოიყენეთ იგივე რაც login პაროლი)\n\n" +
-      "Cancel = გაუქმება"
-    );
-    
-    if (!password) {
-      // User clicked Cancel or empty password
-      console.log('[v2.0] Export cancelled by user');
-      return;
-    }
-    
-    if (password.length < 8) {
-      alert("❌ პაროლი უნდა იყოს მინიმუმ 8 სიმბოლო");
-      return;
-    }
+  // ✅ Export with modal
+  const exportJson = () => {
+    setExportModal("password");
+  };
+  
+  const handleExportWithPassword = async (password) => {
+    setExportModal(null);
     
     try {
-      // Hash password and create encryption key
       const { hash, salt, iterations } = await CryptoModule.hashPassword(password);
       const key = await CryptoModule.deriveKey(password, new Uint8Array(salt), iterations);
-      
-      // Encrypt data
       const encrypted = await CryptoModule.encryptData(data, key);
       
       const exportData = JSON.stringify({
@@ -2596,110 +2747,136 @@ function SettingsPage({ data, saveData }) {
       a.download = filename;
       a.click();
       
-      console.log('[v2.0] Encrypted backup exported successfully');
+      setAlertModal({
+        type: "success",
+        title: "წარმატებული Export",
+        message: "დაშიფრული backup შექმნილია!",
+        details: `📦 ${filename}\n🔒 AES-256-GCM დაშიფვრა\n📊 ${data.cases.length} ჩანაწერი`
+      });
       
     } catch (err) {
-      alert("დაშიფვრა ვერ მოხერხდა: " + err.message);
-      console.error('[v2.0] Export encryption failed:', err);
+      setAlertModal({
+        type: "error",
+        title: "Export-ის შეცდომა",
+        message: "დაშიფვრა ვერ მოხერხდა",
+        details: err.message
+      });
     }
   };
   
-  const importJson = async (e) => {
+  // ✅ Import with modal
+  const importJson = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    
+    setPendingImportFile(file);
     
     const reader = new FileReader();
     reader.onload = async () => {
       try {
         const parsed = JSON.parse(reader.result);
         
-        // ✅ v2.0: Handle both encrypted and plain backups
         if (parsed.encrypted === true) {
-          // Encrypted backup
-          const password = prompt(
-            "🔐 დაშიფრული Backup\n\n" +
-            "შეიყვანეთ backup-ის პაროლი:\n" +
-            "(ის პაროლი რაც export-ისას გამოიყენეთ)\n\n" +
-            "Cancel = გაუქმება"
-          );
-          
-          if (!password) {
-            console.log('[v2.0] Import cancelled by user');
-            return;
-          }
-          
-          try {
-            const key = await CryptoModule.deriveKey(
-              password,
-              new Uint8Array(parsed.salt),
-              parsed.iterations
-            );
-            
-            const decrypted = await CryptoModule.decryptData(
-              parsed.data.encrypted,
-              parsed.data.iv,
-              key
-            );
-            
-            if (decrypted && Array.isArray(decrypted.cases)) {
-              saveData(normalizeData(decrypted));
-              alert(
-                "✅ Backup წარმატებით აღდგა!\n\n" +
-                `ჩანაწერები: ${decrypted.cases.length}\n` +
-                `თანამშრომლები: ${decrypted.employees?.length || 0}\n` +
-                `ვერსია: ${parsed.version || 'უცნობი'}\n` +
-                `თარიღი: ${parsed.timestamp ? new Date(parsed.timestamp).toLocaleString('ka-GE') : '—'}`
-              );
-            } else {
-              alert("❌ ფაილის სტრუქტურა არასწორია");
-            }
-          } catch (err) {
-            alert(
-              "❌ არასწორი პაროლი!\n\n" +
-              "გთხოვთ შეიყვანოთ ის პაროლი, რომელიც export-ისას გამოიყენეთ.\n\n" +
-              "(არ არის აუცილებლად იგივე რაც login პაროლი)"
-            );
-            console.error('[v2.0] Decryption failed:', err);
-          }
+          // Encrypted - ask password
+          setImportModal({
+            type: "encrypted",
+            data: parsed
+          });
         } else if (parsed.encrypted === false && parsed.data) {
-          // Plain text backup (v2.0 format)
-          if (parsed.data && Array.isArray(parsed.data.cases)) {
-            if (confirm(
-              "⚠️ გაფრთხილება!\n\n" +
-              "ეს არის დაუშიფრავი backup (არაუსაფრთხო ფორმატი).\n\n" +
-              "გსურთ აღდგენა?"
-            )) {
-              saveData(normalizeData(parsed.data));
-              alert("✅ Backup აღდგა!");
-            }
-          } else {
-            alert("❌ ფაილის სტრუქტურა არასწორია");
-          }
+          // Plain v2.0 format
+          setImportModal({
+            type: "plain-v2",
+            data: parsed
+          });
         } else if (Array.isArray(parsed.cases)) {
-          // ✅ OLD FORMAT (v1.0 compatibility)
-          if (confirm(
-            "📦 ძველი ფორმატის backup\n\n" +
-            "ეს არის v1.0 backup (დაუშიფრავი).\n\n" +
-            "გსურთ აღდგენა?"
-          )) {
-            saveData(normalizeData(parsed));
-            alert("✅ ძველი backup აღდგა!");
-          }
+          // v1.0 format
+          setImportModal({
+            type: "plain-v1",
+            data: parsed
+          });
         } else {
-          alert("❌ უცნობი ფაილის ფორმატი");
+          setAlertModal({
+            type: "error",
+            title: "Import-ის შეცდომა",
+            message: "უცნობი ფაილის ფორმატი",
+            details: "ფაილი არ შეესაბამება არცერთ ცნობილ ვერსიას"
+          });
         }
       } catch (err) {
-        alert("❌ JSON ფაილი დაზიანებულია:\n\n" + err.message);
-        console.error("[v2.0] Import error:", err);
+        setAlertModal({
+          type: "error",
+          title: "Import-ის შეცდომა",
+          message: "JSON ფაილი დაზიანებულია",
+          details: err.message
+        });
       }
     };
     
     reader.onerror = () => {
-      alert("❌ ფაილის წაკითხვა ვერ მოხერხდა");
+      setAlertModal({
+        type: "error",
+        title: "Import-ის შეცდომა",
+        message: "ფაილის წაკითხვა ვერ მოხერხდა"
+      });
     };
     
     reader.readAsText(file);
     e.target.value = "";
+  };
+  
+  const handleImportWithPassword = async (password) => {
+    const parsed = importModal.data;
+    setImportModal(null);
+    
+    try {
+      const key = await CryptoModule.deriveKey(
+        password,
+        new Uint8Array(parsed.salt),
+        parsed.iterations
+      );
+      
+      const decrypted = await CryptoModule.decryptData(
+        parsed.data.encrypted,
+        parsed.data.iv,
+        key
+      );
+      
+      if (decrypted && Array.isArray(decrypted.cases)) {
+        saveData(normalizeData(decrypted));
+        
+        setAlertModal({
+          type: "success",
+          title: "წარმატებული Import",
+          message: "Backup წარმატებით აღდგა!",
+          details: `📊 ჩანაწერები: ${decrypted.cases.length}\n👥 თანამშრომლები: ${decrypted.employees?.length || 0}\n📅 თარიღი: ${parsed.timestamp ? new Date(parsed.timestamp).toLocaleString('ka-GE') : '—'}`
+        });
+      } else {
+        setAlertModal({
+          type: "error",
+          title: "Import-ის შეცდომა",
+          message: "ფაილის სტრუქტურა არასწორია"
+        });
+      }
+    } catch (err) {
+      setAlertModal({
+        type: "error",
+        title: "დეშიფრაცია ვერ მოხერხდა",
+        message: "არასწორი პაროლი!",
+        details: "გთხოვთ შეიყვანოთ ის პაროლი, რომელიც Export-ისას გამოიყენეთ"
+      });
+    }
+  };
+  
+  const handleImportPlain = (data) => {
+    saveData(normalizeData(data));
+    setImportModal(null);
+    
+    setAlertModal({
+      type: "success",
+      title: "წარმატებული Import",
+      message: "Backup აღდგა!",
+      details: `⚠️ ეს იყო დაუშიფრავი backup`
+    });
   };
   
   return React.createElement("div", { className: "flex flex-col gap-6" },
@@ -2709,11 +2886,12 @@ function SettingsPage({ data, saveData }) {
         "მართეთ ჩამოსაშლელი სიები და მონაცემთა სარეზერვო ასლი."
       )
     ),
+    
     React.createElement("div", { className: "bg-white rounded-lg border border-[#E4E1D6] p-5 flex flex-wrap items-center justify-between gap-3" },
       React.createElement("div", null,
         React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E]" }, "მონაცემთა სარეზერვო ასლი"),
         React.createElement("p", { className: "text-xs text-[#8A8672] mt-0.5" },
-          "გადმოწერეთ ან აღადგინეთ სრული მონაცემთა ბაზა JSON ფაილით."
+          "გადმოწერეთ ან აღადგინეთ სრული მონაცემთა ბაზა დაშიფრული JSON ფაილით."
         )
       ),
       React.createElement("div", { className: "flex gap-2" },
@@ -2740,6 +2918,7 @@ function SettingsPage({ data, saveData }) {
         })
       )
     ),
+    
     React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4" },
       listFields.map(f => React.createElement(ListEditor, {
         key: f.key,
@@ -2751,7 +2930,58 @@ function SettingsPage({ data, saveData }) {
           ? "სამ სტანდარტულ მნიშვნელობას (სრული/ნაწილობრივი/ხარვეზიანი) ფიქსირებული ფერი აქვს."
           : null
       }))
-    )
+    ),
+    
+    // ✅ Export password modal
+    exportModal === "password" && React.createElement(PasswordPromptModal, {
+      title: "📦 Backup Export",
+      message: "შეიყვანეთ პაროლი backup-ის დასაშიფრად:\n(შეინახეთ პაროლი რადგან მის გარეშე ვერ შეძლებთ მის გამოყენებას)",
+      confirmText: "დაშიფვრა და ჩამოტვირთვა",
+      onConfirm: handleExportWithPassword,
+      onCancel: () => setExportModal(null)
+    }),
+    
+    // ✅ Import password modal
+    importModal?.type === "encrypted" && React.createElement(PasswordPromptModal, {
+      title: "🔐 დაშიფრული Backup",
+      message: "შეიყვანეთ backup-ის პაროლი:\n(ის პაროლი რაც Export-ისას გამოიყენეთ)",
+      confirmText: "გაშიფვრა და აღდგენა",
+      onConfirm: handleImportWithPassword,
+      onCancel: () => setImportModal(null)
+    }),
+    
+    // ✅ Import plain v2 confirm
+    importModal?.type === "plain-v2" && React.createElement(ConfirmModalCustom, {
+      title: "⚠️ დაუშიფრავი Backup",
+      message: "ეს არის დაუშიფრავი backup (არაუსაფრთხო ფორმატი).",
+      details: "გსურთ აღდგენა?",
+      icon: "warning",
+      confirmStyle: "primary",
+      confirmText: "დიახ, აღდგენა",
+      onConfirm: () => handleImportPlain(importModal.data.data),
+      onCancel: () => setImportModal(null)
+    }),
+    
+    // ✅ Import plain v1 confirm
+    importModal?.type === "plain-v1" && React.createElement(ConfirmModalCustom, {
+      title: "📦 ძველი ფორმატის Backup",
+      message: "ეს არის v1.0 backup (დაუშიფრავი).",
+      details: "გსურთ აღდგენა?",
+      icon: "folder_open",
+      confirmStyle: "primary",
+      confirmText: "დიახ, აღდგენა",
+      onConfirm: () => handleImportPlain(importModal.data),
+      onCancel: () => setImportModal(null)
+    }),
+    
+    // ✅ Alert modal
+    alertModal && React.createElement(AlertModalCustom, {
+      title: alertModal.title,
+      message: alertModal.message,
+      details: alertModal.details,
+      type: alertModal.type,
+      onClose: () => setAlertModal(null)
+    })
   );
 }
 
