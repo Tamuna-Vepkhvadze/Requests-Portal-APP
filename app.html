@@ -3,11 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QA აუდიტის პლათფორმა - უსაფრთხო</title>
+<title>QA აუდიტის პლათფორმა </title>
 <link rel="icon" type="image/x-icon" href="icon-256x256.ico">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20,400,0,0" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js" crossorigin></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
@@ -42,7 +42,6 @@
     background: #FCEBEB; border: 1px solid #F0999B; border-radius: 8px; padding: 12px;
   }
   
-  /* Password strength meter */
   .pwd-strength {
     height: 4px;
     border-radius: 2px;
@@ -92,7 +91,7 @@
 try {
 
 /* ================================================================== */
-/*  🔐 CRYPTO MODULE                                                  */
+/*  CRYPTO MODULE                                                  */
 /* ================================================================== */
 
 const CryptoModule = {
@@ -121,7 +120,7 @@ const CryptoModule = {
       },
       keyMaterial,
       { name: 'AES-GCM', length: 256 },
-      true,
+      false, 
       ['encrypt', 'decrypt']
     );
   },
@@ -218,10 +217,77 @@ const CryptoModule = {
       const dec = new TextDecoder();
       return JSON.parse(dec.decode(decrypted));
     } catch (e) {
-      throw new Error('დეშიფრაცია ვერ მოხერხდა. პაროლი არასწორია.');
+      throw new Error('დეშიფრაცია ვერ მოხერხდა პაროლი არასწორია ან მონაცემები დაზიანებულია.');
     }
   },
   
+  // ============================================================
+  // v2 KDF SCHEME domain-separated verification hash vs
+  // encryption key (fixes v1 bug where both were byte-identical).
+  // Two-stage derivation: PBKDF2(password) -> master bits,
+  // then HKDF(master bits, info="verify"/"encrypt") -> two
+  // cryptographically independent outputs.
+  // Legacy v1 methods above are kept ONLY for transparently
+  // migrating pre-existing accounts; new accounts always use v2.
+  // ============================================================
+
+  async deriveMasterBits(password, salt, iterations) {
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+    return crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+      keyMaterial,
+      256
+    );
+  },
+
+  async deriveSubkeysV2(masterBits) {
+    const hkdfKey = await crypto.subtle.importKey('raw', masterBits, 'HKDF', false, ['deriveBits', 'deriveKey']);
+    const verifyBits = await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode('qa-audit-verify-v1') },
+      hkdfKey,
+      256
+    );
+    const encryptionKey = await crypto.subtle.deriveKey(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode('qa-audit-encrypt-v1') },
+      hkdfKey,
+      { name: 'AES-GCM', length: 256 },
+      false, 
+      ['encrypt', 'decrypt']
+    );
+    return { verifyHash: Array.from(new Uint8Array(verifyBits)), encryptionKey };
+  },
+
+
+  async createCredentialsV2(password, iterations = this.PBKDF2_ITERATIONS) {
+    const salt = this.generateSalt();
+    const masterBits = await this.deriveMasterBits(password, salt, iterations);
+    const { verifyHash, encryptionKey } = await this.deriveSubkeysV2(masterBits);
+    return {
+      hash: verifyHash,
+      salt: Array.from(salt),
+      iterations,
+      scheme: 'v2',
+      encryptionKey
+    };
+  },
+
+
+  async verifyAndDeriveV2(password, storedHash, storedSalt, iterations) {
+    const salt = new Uint8Array(storedSalt);
+    const masterBits = await this.deriveMasterBits(password, salt, iterations);
+    const { verifyHash, encryptionKey } = await this.deriveSubkeysV2(masterBits);
+
+    if (verifyHash.length !== storedHash.length) return null;
+    let diff = 0;
+    for (let i = 0; i < verifyHash.length; i++) {
+      diff |= verifyHash[i] ^ storedHash[i];
+    }
+    return diff === 0 ? encryptionKey : null;
+  },
+
   checkPasswordStrength(password) {
     if (password.length < 8) return 0;
     
@@ -239,7 +305,7 @@ const CryptoModule = {
 };
 
 /* ================================================================== */
-/*  💾 SECURE STORAGE                                                 */
+/*  SECURE STORAGE                                                 */
 /* ================================================================== */
 
 const QA_IDB_NAME = "qa_audit_secure_v1";
@@ -316,6 +382,18 @@ const SecureStorage = {
     });
   },
   
+  async saveUserAndData(userData, encryptedPayload) {
+    const tx = this.db.transaction(['user', 'encrypted_data'], 'readwrite');
+
+    return new Promise((resolve, reject) => {
+      tx.objectStore('user').put({ id: 'main', ...userData });
+      tx.objectStore('encrypted_data').put({ id: 'main', ...encryptedPayload });
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+    });
+  },
+
   async deleteAllData() {
     const tx = this.db.transaction(['user', 'encrypted_data'], 'readwrite');
     
@@ -328,21 +406,67 @@ const SecureStorage = {
   }
 };
 
+
+const PersistentStorage = {
+
+  async isSupported() {
+    return !!(navigator.storage && navigator.storage.persist && navigator.storage.persisted);
+  },
+
+  isFileProtocol() {
+    try { return window.location.protocol === 'file:'; } catch { return false; }
+  },
+
+  async check() {
+    try {
+      if (!(await this.isSupported())) return null;
+      return await navigator.storage.persisted();
+    } catch {
+      return null;
+    }
+  },
+
+  async request() {
+    try {
+      if (!(await this.isSupported())) return null;
+      const already = await navigator.storage.persisted();
+      if (already) return true;
+
+      const timeout = new Promise(resolve => setTimeout(() => resolve('__timeout__'), 6000));
+      const result = await Promise.race([navigator.storage.persist(), timeout]);
+      if (result === '__timeout__') {
+        console.warn('[persistent-storage] persist() did not settle within 6s treating as inconclusive');
+        return null;
+      }
+      return result;
+    } catch (err) {
+      console.error('[persistent-storage] request() failed:', err);
+      return null;
+    }
+  }
+};
+
 /* ================================================================== */
-/*  ⚛️ REACT SETUP                                                    */
+/*  REACT SETUP                                                    */
 /* ================================================================== */
 
 const { useState, useEffect, useMemo, useRef, useCallback, Fragment } = React;
 
-function Icon({ name, size = 16, className = "" }) {
+function Icon({ name, size = 16, className = "", style = {}, filled = false }) {
   return React.createElement("span", {
     className: `material-symbols-outlined ${className}`,
-    style: { fontSize: size, lineHeight: 1, display: "inline-block" }
+    style: {
+      fontSize: size,
+      lineHeight: 1,
+      display: "inline-block",
+      fontVariationSettings: `'FILL' ${filled ? 1 : 0}, 'wght' 400, 'GRAD' 0, 'opsz' 20`,
+      ...style
+    }
   }, name);
 }
 
 /* ================================================================== */
-/*  📊 DATA & CONSTANTS                                               */
+/*  DATA & CONSTANTS                                               */
 /* ================================================================== */
 
 const JIRA_BASE_URL = "https://jira.lb.ge/login.jsp?permissionViolation=true&os_destination=%2Fbrowse%2F";
@@ -354,60 +478,25 @@ function jiraUrl(key) {
   return JIRA_BASE_URL + encodeURIComponent(raw);
 }
 
+
 const SEED_DATA = {
-  categories: ["არასტანდარტული % ანაბარზე", "მეილით შემოსული მოთხოვნა", "ანაბრის დარღვევა", "იურიდიული პირები", "სხვა ტექნიკური მოთხოვნა"],
-  departments: ["Back Office", "საბანკო ოპერაციები", "ცენტრალური ოფისი", "ქოლ-ცენტრი", "იურიდიული დეპარტამენტი"],
-  helpTypes: ["პროცედურული", "ტექნიკური", "კონსულტაცია"],
-  delayReasons: ["არასრულყოფილი მოთხოვნა", "არ ჰქონდა თანხმობა", "გადამისამართდა"],
-  statuses: ["დახურულია", "მიმდინარეობს", "განხილვაშია"],
-  auditResults: ["სრული", "ნაწილობრივი", "ხარვეზიანი"],
-  employees: [
-    { id: "e1", name: "ნინო მაისურაძე", role: "მთავარი სპეციალისტი" },
-    { id: "e2", name: "გიორგი ბერიძე", role: "წამყვანი სპეციალისტი" },
-    { id: "e3", name: "თამარ ხუციშვილი", role: "სპეციალისტი" },
-    { id: "e4", name: "დავით ლომიძე", role: "სპეციალისტი" },
-    { id: "e5", name: "ეკა წიკლაური", role: "უფროსი სპეციალისტი" }
-  ],
-  cases: [
-    {
-      id: "c1",
-      no: 1,
-      auditDate: "2025-01-15",
-      incidentDate: "2025-01-12",
-      jira: "JIRA-4821",
-      operator: "ნინო მაისურაძე",
-      department: "Back Office",
-      category: "არასტანდარტული % ანაბარზე",
-      helpType: "კონსულტაცია",
-      delayReason: "არასრულყოფილი მოთხოვნა",
-      otherReason: "",
-      problem: "ოპერატორის შეცდომა",
-      recommendation: "დამატებითი ინსტრუქცია გაეგზავნა",
-      status: "დახურულია",
-      auditResult: "სრული"
-    },
-    {
-      id: "c2",
-      no: 2,
-      auditDate: "2025-01-20",
-      incidentDate: "2025-01-18",
-      jira: "JIRA-4822",
-      operator: "გიორგი ბერიძე",
-      department: "საბანკო ოპერაციები",
-      category: "ანაბრის დარღვევა",
-      helpType: "ტექნიკური",
-      delayReason: "არ ჰქონდა თანხმობა",
-      otherReason: "",
-      problem: "დოკუმენტაცია არასრული იყო",
-      recommendation: "დოკუმენტების სრული პაკეტის მოთხოვნა",
-      status: "მიმდინარეობს",
-      auditResult: "ნაწილობრივი"
-    }
-  ]
+  categories: [],
+  departments: [],
+  helpTypes: [],
+  delayReasons: [],
+  statuses: [],
+  auditResults: [],
+  incidentTypes: [],
+  employees: [],
+  cases: [],
+  incidents: [],
+  responsibleName: "",
+  responsiblePosition: ""
 };
 
 function normalizeData(raw) {
   const safeArr = (v, fallback) => Array.isArray(v) ? v : fallback;
+  const safeStr = (v) => typeof v === "string" ? v : "";
   return {
     categories: safeArr(raw?.categories, SEED_DATA.categories),
     departments: safeArr(raw?.departments, SEED_DATA.departments),
@@ -415,8 +504,12 @@ function normalizeData(raw) {
     delayReasons: safeArr(raw?.delayReasons, SEED_DATA.delayReasons),
     statuses: safeArr(raw?.statuses, SEED_DATA.statuses),
     auditResults: safeArr(raw?.auditResults, SEED_DATA.auditResults),
+    incidentTypes: safeArr(raw?.incidentTypes, SEED_DATA.incidentTypes),
     employees: safeArr(raw?.employees, SEED_DATA.employees),
-    cases: safeArr(raw?.cases, SEED_DATA.cases)
+    cases: safeArr(raw?.cases, SEED_DATA.cases),
+    incidents: safeArr(raw?.incidents, SEED_DATA.incidents),
+    responsibleName: safeStr(raw?.responsibleName),
+    responsiblePosition: safeStr(raw?.responsiblePosition)
   };
 }
 
@@ -435,7 +528,185 @@ const AUDIT_RESULT_COLOR = {
 const TALLY_PALETTE = ["#16213E", "#2A4270", "#B8860B", "#C0392B", "#1F6F50", "#6B7A99", "#8C6B21"];
 
 /* ================================================================== */
-/*  🛠️ HELPER FUNCTIONS                                              */
+/*  REUSABLE EXCEL CHART HELPERS (canvas -> PNG)                   */
+/* ================================================================== */
+
+function chartDrawDonut(rows, canvasW, canvasH, titleText, palette) {
+  palette = palette || TALLY_PALETTE;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvasW;
+  canvas.height = canvasH;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvasW, canvasH);
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillStyle = "#16213E";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(titleText, 4, 4);
+  const topPad = 34;
+  const sum = rows.reduce((s, [, v]) => s + v, 0) || 1;
+  const donutSize = Math.min(canvasH - topPad - 12, 160);
+  const cx = donutSize / 2 + 16, cy = topPad + (canvasH - topPad) / 2, r = donutSize / 2 - 4;
+  let start = -Math.PI / 2;
+  rows.forEach(([, value], i) => {
+    const angle = value / sum * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, r, start, start + angle);
+    ctx.closePath();
+    ctx.fillStyle = palette[i % palette.length];
+    ctx.fill();
+    start += angle;
+  });
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 0.55, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
+  ctx.fillStyle = "#16213E";
+  ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(sum), cx, cy - 8);
+  ctx.font = "10px sans-serif";
+  ctx.fillStyle = "#8A8672";
+  ctx.fillText("სულ", cx, cy + 12);
+  const lx = donutSize + 40;
+  const availW = canvasW - lx - 60;
+  const lineH = Math.min(30, (canvasH - topPad - 8) / Math.max(rows.length, 1));
+  rows.forEach(([label, value], i) => {
+    const ly = topPad + i * lineH + lineH / 2;
+    ctx.fillStyle = palette[i % palette.length];
+    ctx.fillRect(lx, ly - 7, 14, 14);
+    ctx.font = "13px sans-serif";
+    let display = label;
+    while (ctx.measureText(display).width > availW && display.length > 4) {
+      display = display.slice(0, -2);
+    }
+    if (display !== label) display = display.replace(/\s+$/, "") + "…";
+    ctx.fillStyle = "#3A3A32";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(display, lx + 22, ly);
+    ctx.fillStyle = "#16213E";
+    ctx.font = "bold 13px sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(String(value), canvasW - 10, ly);
+  });
+  return canvas.toDataURL("image/png");
+}
+
+function chartDrawBar(rows, width, height, titleText, palette) {
+  palette = palette || TALLY_PALETTE;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, height);
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillStyle = "#16213E";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(titleText, 4, 4);
+  const topPad = 34;
+  const max = Math.max(...rows.map(([, v]) => v), 1);
+  ctx.font = "13px sans-serif";
+  let widest = 0;
+  rows.forEach(([label]) => {
+    const w = ctx.measureText(label).width;
+    if (w > widest) widest = w;
+  });
+  const leftPad = Math.min(Math.max(widest + 26, 120), width * 0.42);
+  const rightPad = 50;
+  const n = Math.max(rows.length, 1);
+  const barH = Math.min(26, Math.floor((height - topPad - 10) / n) - 8);
+  rows.forEach(([label, value], i) => {
+    const y = topPad + i * (barH + 8);
+    let display = label;
+    let font = "13px sans-serif";
+    ctx.font = font;
+    if (ctx.measureText(display).width > leftPad - 14) {
+      font = "11px sans-serif";
+      ctx.font = font;
+    }
+    ctx.fillStyle = "#3A3A32";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(display, leftPad - 10, y + barH / 2);
+    const barW = (width - leftPad - rightPad) * value / max;
+    ctx.fillStyle = palette[i % palette.length];
+    ctx.fillRect(leftPad, y, Math.max(barW, 2), barH);
+    ctx.fillStyle = "#16213E";
+    ctx.font = "bold 13px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(String(value), leftPad + barW + 8, y + barH / 2);
+  });
+  return canvas.toDataURL("image/png");
+}
+
+const EXCEL_COLORS = {
+  NAVY: "FF16213E", GREEN: "FF1F6F50", RED: "FFC0392B", GOLD: "FFB8860B",
+  PAPER: "FFFBF9F3", WHITE: "FFFFFFFF", BORDERC: "FFDBD7C8", MUTED: "FF8A8672"
+};
+
+
+function excelColLetter(n) {
+  let s = "";
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+
+function paintExcelBanner(sheet, navyArgb, dataColCount) {
+  const cols = Math.max(dataColCount || 10, 2);
+  for (let r = 1; r <= 3; r++) {
+    for (let c = 1; c <= cols; c++) {
+      sheet.getCell(r, c).fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: navyArgb }
+      };
+    }
+  }
+  sheet.getRow(1).height = 10;
+  sheet.getRow(2).height = 30;
+  sheet.getRow(3).height = 24;
+  return excelColLetter(Math.max(cols - 1, 2));
+}
+
+function applyExcelPrintSetup(sheet, {
+  lastColLetter,
+  lastRow,
+  titleRows = "1:5",
+  orientation = "landscape"
+}) {
+  sheet.pageSetup = {
+    orientation,
+    fitToPage: true,
+    fitToWidth: 1,
+    fitToHeight: 0,
+    paperSize: 9, 
+    horizontalCentered: true,
+    margins: {
+      left: 0.35,
+      right: 0.35,
+      top: 0.4,
+      bottom: 0.4,
+      header: 0,
+      footer: 0.2
+    },
+    printArea: `A1:${lastColLetter}${Math.max(lastRow, 5)}`,
+    printTitlesRow: titleRows
+  };
+}
+
+/* ================================================================== */
+/*  HELPER FUNCTIONS                                              */
 /* ================================================================== */
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -471,10 +742,61 @@ function formatDate(dateStr) {
   return `${d}.${m}.${y}`;
 }
 
+function formatDateTime(iso) {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString("ka-GE", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "—";
+  }
+}
+
+const BACKUP_REMINDER_DAYS = 7;
+
+function daysSince(iso) {
+  if (!iso) return null;
+  const diffMs = Date.now() - new Date(iso).getTime();
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
+
+function isBackupStale(lastBackupAt) {
+  const d = daysSince(lastBackupAt);
+  return d === null || d >= BACKUP_REMINDER_DAYS;
+}
+
+/* ================================================================== */
+/*   SHARED DOCUMENT HEADER (used by every PDF & Excel export)      */
+/*  Formats the generation date/time as DD/MM/YYYY + HH:MM, and       */
+/*  resolves the responsible-person text from Settings, with a        */
+/*  clear fallback when it hasn't been filled in.                     */
+/* ================================================================== */
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+
+function formatDocDate(d) {
+  d = d || new Date();
+  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}`;
+}
+
+function formatDocTime(d) {
+  d = d || new Date();
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+function getResponsiblePersonLines(data) {
+  const name = (data?.responsibleName || "").trim();
+  const position = (data?.responsiblePosition || "").trim();
+  if (!name) {
+    return { primary: "პასუხისმგებელი პირი მითითებული არ არის", secondary: "" };
+  }
+  return { primary: name, secondary: position };
+}
+
 function tally(list, key) {
   const map = {};
   list.forEach(item => {
-    const v = item[key] || "მიზეზი მითითებული არ არის";
+    const v = item[key] || "შეფერხების გარეშე ✓";
     map[v] = (map[v] || 0) + 1;
   });
   return Object.entries(map).sort((a, b) => b[1] - a[1]);
@@ -493,7 +815,7 @@ function applyFilters(cases, f) {
 }
 
 /* ================================================================== */
-/*  🎨 SHARED UI COMPONENTS                                           */
+/*   SHARED UI COMPONENTS                                           */
 /* ================================================================== */
 
 function FontStyles() {
@@ -521,9 +843,61 @@ function FontStyles() {
       border-radius: 999px;
       opacity: .5;
     }
+    @page {
+      size: A4;
+      margin: 0 !important;
+    }
     @media print {
+      * {
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+      }
+      /* Hide entire app UI; only the print root is shown */
       .qa-noprint { display: none !important; }
-      body { background: white !important; }
+      html, body, #root, .qa-root {
+        background: white !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        width: 100% !important;
+        height: auto !important;
+        overflow: visible !important;
+      }
+      /* Classic print isolation: hide everything, then reveal print root */
+      body * {
+        visibility: hidden !important;
+      }
+      .qa-print-root,
+      .qa-print-root * {
+        visibility: visible !important;
+      }
+      .qa-print-root {
+        display: block !important;
+        position: absolute !important;
+        left: 0 !important;
+        top: 0 !important;
+        width: 100% !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        background: white !important;
+      }
+      /* Full-bleed navy header flush to paper edges */
+      .qa-print-header {
+        display: block !important;
+        width: 100% !important;
+        max-width: none !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        position: relative !important;
+        left: 0 !important;
+        right: 0 !important;
+        top: 0 !important;
+        box-sizing: border-box !important;
+      }
+      .qa-print-header-inner {
+        width: 100% !important;
+        margin: 0 !important;
+        box-sizing: border-box !important;
+      }
     }
   `);
 }
@@ -641,23 +1015,69 @@ function StatusDonut({ rows, total }) {
   );
 }
 
-function Modal({ title, onClose, children, wide }) {
+function GenericDonut({ rows, total, colors }) {
+  const palette = colors || TALLY_PALETTE;
+  let acc = 0;
+  const segments = rows.map(([, value], i) => {
+    const pct = total ? value / total * 100 : 0;
+    const start = acc;
+    acc += pct;
+    return `${palette[i % palette.length]} ${start}% ${acc}%`;
+  });
+  const gradient = segments.length
+    ? `conic-gradient(${segments.join(", ")})`
+    : "conic-gradient(#2A4270 0% 100%)";
+  
+  return React.createElement("div", { className: "bg-[#16213E] rounded-lg p-5 flex items-center gap-4 text-white" },
+    React.createElement("div", {
+      className: "w-28 h-28 shrink-0 relative rounded-full",
+      style: { background: gradient }
+    },
+      React.createElement("div", { className: "absolute inset-[12px] rounded-full bg-[#16213E] flex flex-col items-center justify-center" },
+        React.createElement("span", { className: "qa-serif text-xl font-bold" }, total),
+        React.createElement("span", { className: "text-[9px] uppercase tracking-widest text-[#8FA0C4]" }, "სულ")
+      )
+    ),
+    React.createElement("div", { className: "flex-1 flex flex-col gap-2" },
+      rows.map(([name, value], i) =>
+        React.createElement("div", { key: name, className: "flex items-center justify-between text-sm" },
+          React.createElement("span", { className: "flex items-center gap-2 text-[#D7DEEE]" },
+            React.createElement("span", {
+              className: "w-2 h-2 rounded-full",
+              style: { background: palette[i % palette.length] }
+            }),
+            name
+          ),
+          React.createElement("span", { className: "qa-mono font-semibold" }, value)
+        )
+      ),
+      rows.length === 0 && React.createElement("span", { className: "text-sm text-[#8FA0C4] italic" }, "მონაცემი არ არის")
+    )
+  );
+}
+
+function Modal({ title, onClose, children, wide, size }) {
+  const maxWidthPx = size === "xl" ? 860 : size === "lg" ? 720 : wide ? 672 : 448;
+  const roomy = size === "xl";
   return React.createElement("div", {
     className: "fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#16213E]/50 backdrop-blur-[2px]",
     onClick: onClose
   },
     React.createElement("div", {
-      className: `qa-fade-up bg-[#FBF9F3] rounded-xl shadow-2xl w-full ${wide ? "max-w-2xl" : "max-w-md"} max-h-[88vh] overflow-y-auto qa-scroll`,
+      className: "qa-fade-up bg-[#FBF9F3] rounded-xl shadow-2xl w-full max-h-[88vh] overflow-y-auto qa-scroll",
+      style: { maxWidth: maxWidthPx },
       onClick: e => e.stopPropagation()
     },
-      React.createElement("div", { className: "flex items-center justify-between px-6 py-4 border-b border-[#E4E1D6] sticky top-0 bg-[#FBF9F3] z-10" },
+      React.createElement("div", {
+        className: `flex items-center justify-between px-6 ${roomy ? "py-5" : "py-4"} border-b border-[#E4E1D6] sticky top-0 bg-[#FBF9F3] z-10`
+      },
         React.createElement("h2", { className: "qa-serif text-lg font-bold text-[#16213E]" }, title),
         React.createElement("button", {
           onClick: onClose,
           className: "p-1.5 rounded-md hover:bg-[#EFEDE2] text-[#8A8672]"
         }, React.createElement(Icon, { name: "close", size: 18 }))
       ),
-      React.createElement("div", { className: "px-6 py-5" }, children)
+      React.createElement("div", { className: `px-6 ${roomy ? "py-6" : "py-5"}` }, children)
     )
   );
 }
@@ -683,7 +1103,7 @@ function ConfirmDialog({ text, onConfirm, onCancel }) {
 
 
 /* ================================================================== */
-/*  🎨 CUSTOM MODALS FOR BACKUP                                       */
+/*   CUSTOM MODALS FOR BACKUP                                       */
 /* ================================================================== */
 
 function PasswordPromptModal({ title, message, onConfirm, onCancel, confirmText = "დადასტურება", minLength = 8 }) {
@@ -842,7 +1262,203 @@ function AlertModalCustom({ title, message, details, type = "info", onClose }) {
 }
 
 /* ================================================================== */
-/*  🔐 REGISTRATION PAGE                                              */
+/*  CHANGE PASSWORD MODAL                                          */
+/*  Safe flow: re-verify current password against storage (independent */
+/*  of the already-unlocked session) -> fresh salt + v2 credentials ->  */
+/*  re-encrypt the in-memory data with the new key -> atomic dual-store */
+/*  write -> only then hand the new key back to the caller. Any        */
+/*  failure aborts before anything is written, so there is no path     */
+/*  that can leave the account half-changed or the data unreadable.    */
+/* ================================================================== */
+
+function ChangePasswordModal({ getLatestData, onPrepare, onSuccess, onClose }) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const strength = CryptoModule.checkPasswordStrength(newPassword);
+  const strengthLabel = ["", "სუსტი", "საშუალო", "ძლიერი"][strength];
+  const strengthClass = ["", "pwd-weak", "pwd-medium", "pwd-strong"][strength];
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+
+    if (!currentPassword) {
+      setError("შეიყვანეთ მიმდინარე პაროლი");
+      return;
+    }
+    if (newPassword.length < 8) {
+      setError("ახალი პაროლი უნდა იყოს მინიმუმ 8 სიმბოლო");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError("ახალი პაროლები არ ემთხვევა");
+      return;
+    }
+    if (strength < 2) {
+      setError("ახალი პაროლი ძალიან სუსტია. გამოიყენეთ დიდი/პატარა ასოები და ციფრები.");
+      return;
+    }
+    if (newPassword === currentPassword) {
+      setError("ახალი პაროლი არ უნდა ემთხვეოდეს მიმდინარეს");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+
+      if (typeof onPrepare === "function") {
+        await onPrepare();
+      }
+
+      const user = await SecureStorage.getUser();
+      if (!user) {
+        setError("მომხმარებელი ვერ მოიძებნა");
+        setLoading(false);
+        return;
+      }
+
+      let currentValid = false;
+      if (user.scheme === 'v2') {
+        const key = await CryptoModule.verifyAndDeriveV2(currentPassword, user.passwordHash, user.salt, user.iterations);
+        currentValid = !!key;
+      } else {
+        currentValid = await CryptoModule.verifyPassword(currentPassword, user.passwordHash, user.salt, user.iterations);
+      }
+
+      if (!currentValid) {
+        setError(" მიმდინარე პაროლი არასწორია");
+        setLoading(false);
+        return;
+      }
+
+      const { hash, salt, iterations, scheme, encryptionKey: newKey } = await CryptoModule.createCredentialsV2(newPassword);
+
+      const latestData = typeof getLatestData === "function" ? getLatestData() : null;
+      if (!latestData) {
+        setError("მონაცემები ვერ მოიძებნა სცადეთ თავიდან");
+        setLoading(false);
+        return;
+      }
+      const newEncryptedPayload = await CryptoModule.encryptData(latestData, newKey);
+
+      await SecureStorage.saveUserAndData(
+        {
+          ...user,
+          passwordHash: hash,
+          salt: salt,
+          iterations: iterations,
+          scheme: scheme
+        },
+        newEncryptedPayload
+      );
+
+      await onSuccess(newKey);
+      setLoading(false);
+    } catch (err) {
+      setError("პაროლის შეცვლა ვერ მოხერხდა: " + (err.message || err));
+      setLoading(false);
+    }
+  };
+
+  return React.createElement(Modal, { title: "პაროლის შეცვლა", onClose: onClose },
+    React.createElement("form", { onSubmit: handleSubmit, className: "flex flex-col gap-4" },
+      React.createElement("div", {
+        className: "bg-[#E6EBF4] border border-[#C4CCE0] rounded-md px-3 py-2 text-xs text-[#2A4270] flex gap-2"
+      },
+        React.createElement(Icon, { name: "info", size: 14, className: "shrink-0 mt-0.5" }),
+        React.createElement("span", null, "თქვენი მონაცემები ავტომატურად გადაიშიფრება ახალი პაროლით.")
+      ),
+
+      React.createElement(Field, { label: "მიმდინარე პაროლი" },
+        React.createElement("input", {
+          type: showPw ? "text" : "password",
+          className: inputCls,
+          value: currentPassword,
+          autoFocus: true,
+          onChange: e => { setError(""); setCurrentPassword(e.target.value); }
+        })
+      ),
+
+      React.createElement(Field, {
+        label: "ახალი პაროლი",
+        hint: "მინიმუმ 8 სიმბოლო, სასურველია დიდი/პატარა ასოები და ციფრები"
+      },
+        React.createElement("input", {
+          type: showPw ? "text" : "password",
+          className: inputCls,
+          value: newPassword,
+          onChange: e => { setError(""); setNewPassword(e.target.value); }
+        }),
+        newPassword && React.createElement("div", { className: "mt-2" },
+          React.createElement("div", { className: "flex justify-between text-xs mb-1" },
+            React.createElement("span", { className: "text-[#9A967F]" }, "პაროლის სიძლიერე:"),
+            React.createElement("span", {
+              className: strength === 3 ? "text-[#1F6F50]" : strength === 2 ? "text-[#B8860B]" : "text-[#C0392B]",
+              style: { fontWeight: 600 }
+            }, strengthLabel)
+          ),
+          React.createElement("div", { className: "h-1 bg-[#EFEDE2] rounded-full overflow-hidden" },
+            React.createElement("div", { className: `pwd-strength ${strengthClass}` })
+          )
+        )
+      ),
+
+      React.createElement(Field, { label: "ახალი პაროლის დადასტურება" },
+        React.createElement("input", {
+          type: showPw ? "text" : "password",
+          className: inputCls,
+          value: confirmPassword,
+          onChange: e => { setError(""); setConfirmPassword(e.target.value); }
+        })
+      ),
+
+      React.createElement("label", { className: "flex items-center gap-2 text-xs text-[#8A8672] cursor-pointer select-none" },
+        React.createElement("input", {
+          type: "checkbox",
+          checked: showPw,
+          onChange: e => setShowPw(e.target.checked),
+          className: "w-3.5 h-3.5 accent-[#B8860B]"
+        }),
+        "პაროლების ჩვენება"
+      ),
+
+      error && React.createElement("div", {
+        className: "bg-[#F6E4E1] border border-[#F0999B] rounded-md px-3 py-2 text-xs text-[#C0392B] flex gap-2"
+      },
+        React.createElement(Icon, { name: "error", size: 14, className: "shrink-0" }),
+        React.createElement("span", null, error)
+      ),
+
+      React.createElement("div", { className: "flex justify-end gap-2 mt-2" },
+        React.createElement("button", {
+          type: "button",
+          onClick: onClose,
+          disabled: loading,
+          className: "px-4 py-2 rounded-md text-sm font-semibold text-[#6B6A5C] hover:bg-[#EFEDE2] disabled:opacity-40"
+        }, "გაუქმება"),
+        React.createElement("button", {
+          type: "submit",
+          disabled: loading,
+          className: "px-4 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057] disabled:opacity-40 flex items-center gap-1.5"
+        },
+          loading
+            ? React.createElement(Icon, { name: "progress_activity", size: 15, className: "animate-pulse" })
+            : React.createElement(Icon, { name: "lock_reset", size: 15 }),
+          loading ? "იცვლება..." : "პაროლის შეცვლა"
+        )
+      )
+    )
+  );
+}
+
+/* ================================================================== */
+/*  REGISTRATION PAGE                                              */
 /* ================================================================== */
 
 function RegistrationPage({ onRegister }) {
@@ -885,20 +1501,22 @@ function RegistrationPage({ onRegister }) {
     setLoading(true);
     
     try {
-      const { hash, salt, iterations } = await CryptoModule.hashPassword(password);
-      
-      await SecureStorage.saveUser({
-        email: email.toLowerCase().trim(),
-        passwordHash: hash,
-        salt: salt,
-        iterations: iterations,
-        createdAt: new Date().toISOString()
-      });
-      
-      const encryptionKey = await CryptoModule.deriveKey(password, new Uint8Array(salt), iterations);
+      const { hash, salt, iterations, scheme, encryptionKey } = await CryptoModule.createCredentialsV2(password);
       const encryptedPayload = await CryptoModule.encryptData(SEED_DATA, encryptionKey);
-      await SecureStorage.saveEncryptedData(encryptedPayload);
-      
+
+      await SecureStorage.saveUserAndData(
+        {
+          email: email.toLowerCase().trim(),
+          passwordHash: hash,
+          salt: salt,
+          iterations: iterations,
+          scheme: scheme,
+          createdAt: new Date().toISOString(),
+          lastBackupAt: null
+        },
+        encryptedPayload
+      );
+
       onRegister(encryptionKey, SEED_DATA, email);
       
     } catch (err) {
@@ -1009,7 +1627,7 @@ function RegistrationPage({ onRegister }) {
 }
 
 /* ================================================================== */
-/*  🔑 LOGIN PAGE                                                     */
+/*  LOGIN PAGE                                                     */
 /* ================================================================== */
 
 function LoginPage({ userEmail, onLogin, onReset }) {
@@ -1018,9 +1636,14 @@ function LoginPage({ userEmail, onLogin, onReset }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   
-  // ✅ v2.0: Brute-force protection - persistent across refresh
-  const LOCKOUT_KEY = `qa_lockout_${userEmail}`;
-  const ATTEMPTS_KEY = `qa_attempts_${userEmail}`;
+  const emailTag = useMemo(() => {
+    let h = 5381;
+    const s = String(userEmail || "");
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36);
+  }, [userEmail]);
+  const LOCKOUT_KEY = `qa_lockout_${emailTag}`;
+  const ATTEMPTS_KEY = `qa_attempts_${emailTag}`;
   
   const [loginAttempts, setLoginAttempts] = useState(() => {
     try {
@@ -1038,7 +1661,6 @@ function LoginPage({ userEmail, onLogin, onReset }) {
         if (timestamp > Date.now()) {
           return timestamp;
         } else {
-          // Lockout expired - clean up
           localStorage.removeItem(LOCKOUT_KEY);
           localStorage.removeItem(ATTEMPTS_KEY);
           return null;
@@ -1052,7 +1674,6 @@ function LoginPage({ userEmail, onLogin, onReset }) {
   
   const [remainingSeconds, setRemainingSeconds] = useState(0);
   
-  // Real-time countdown
   useEffect(() => {
     if (lockedUntil) {
       const interval = setInterval(() => {
@@ -1065,7 +1686,6 @@ function LoginPage({ userEmail, onLogin, onReset }) {
           setRemainingSeconds(0);
           setError("");
           
-          // Clean up localStorage
           localStorage.removeItem(LOCKOUT_KEY);
           localStorage.removeItem(ATTEMPTS_KEY);
         } else {
@@ -1082,7 +1702,6 @@ function LoginPage({ userEmail, onLogin, onReset }) {
     e.stopPropagation();
     setError("");
     
-    // Check lockout
     if (lockedUntil && Date.now() < lockedUntil) {
       const mins = Math.floor(remainingSeconds / 60);
       const secs = remainingSeconds % 60;
@@ -1099,19 +1718,29 @@ function LoginPage({ userEmail, onLogin, onReset }) {
         setLoading(false);
         return;
       }
-      
-      const isValid = await CryptoModule.verifyPassword(
-        password,
-        user.passwordHash,
-        user.salt,
-        user.iterations
-      );
-      
-      if (!isValid) {
+
+      const encrypted = await SecureStorage.getEncryptedData();
+      if (!encrypted) {
+        setError("დაშიფრული მონაცემები ვერ მოიძებნა");
+        setLoading(false);
+        return;
+      }
+
+      let encryptionKey = null;
+      if (user.scheme === 'v2') {
+        encryptionKey = await CryptoModule.verifyAndDeriveV2(password, user.passwordHash, user.salt, user.iterations);
+      } else {
+        const isValidLegacy = await CryptoModule.verifyPassword(password, user.passwordHash, user.salt, user.iterations);
+        if (isValidLegacy) {
+          encryptionKey = await CryptoModule.deriveKey(password, new Uint8Array(user.salt), user.iterations);
+        }
+      }
+
+      if (!encryptionKey) {
         const newAttempts = loginAttempts + 1;
         setLoginAttempts(newAttempts);
         
-        // ✅ Save to localStorage
+
         localStorage.setItem(ATTEMPTS_KEY, String(newAttempts));
         
         if (newAttempts >= 5) {
@@ -1121,43 +1750,48 @@ function LoginPage({ userEmail, onLogin, onReset }) {
           setLockedUntil(lockUntil);
           setRemainingSeconds(300);
           
-          // ✅ Save lockout to localStorage
           localStorage.setItem(LOCKOUT_KEY, String(lockUntil));
           
           setError(`⚠️ 5 წარუმატებელი მცდელობა. ბლოკირებულია 5:00 წუთით.`);
         } else {
-          setError(`❌ პაროლი არასწორია (${newAttempts}/5 მცდელობა)`);
+          setError(` პაროლი არასწორია (${newAttempts}/5 მცდელობა)`);
         }
         setLoading(false);
         return;
       }
       
-      // ✅ Success - reset attempts and clear localStorage
       setLoginAttempts(0);
       setLockedUntil(null);
       setRemainingSeconds(0);
       localStorage.removeItem(LOCKOUT_KEY);
       localStorage.removeItem(ATTEMPTS_KEY);
-      
-      const encryptionKey = await CryptoModule.deriveKey(
-        password,
-        new Uint8Array(user.salt),
-        user.iterations
-      );
-      
-      const encrypted = await SecureStorage.getEncryptedData();
-      if (!encrypted) {
-        setError("დაშიფრული მონაცემები ვერ მოიძებნა");
-        setLoading(false);
-        return;
-      }
-      
+
       const decryptedData = await CryptoModule.decryptData(
         encrypted.encrypted,
         encrypted.iv,
         encryptionKey
       );
-      
+
+      if (user.scheme !== 'v2') {
+        try {
+          const migrated = await CryptoModule.createCredentialsV2(password);
+          const newEncryptedPayload = await CryptoModule.encryptData(decryptedData, migrated.encryptionKey);
+          await SecureStorage.saveUserAndData(
+            {
+              ...user,
+              passwordHash: migrated.hash,
+              salt: migrated.salt,
+              iterations: migrated.iterations,
+              scheme: migrated.scheme
+            },
+            newEncryptedPayload
+          );
+          encryptionKey = migrated.encryptionKey;
+        } catch (migrationErr) {
+          console.warn('[security] v2 migration skipped, will retry next login:', migrationErr);
+        }
+      }
+
       onLogin(encryptionKey, normalizeData(decryptedData), user.email);
       
     } catch (err) {
@@ -1214,7 +1848,6 @@ function LoginPage({ userEmail, onLogin, onReset }) {
         )
       ),
       
-      // Lockout countdown
       lockedUntil && remainingSeconds > 0 && React.createElement("div", {
         className: "bg-[#F6E4E1] border border-[#F0999B] rounded-md px-4 py-3 text-center"
       },
@@ -1324,7 +1957,7 @@ function FilterBar({ filters, setFilters, years }) {
 }
 
 /* ================================================================== */
-/*  📋 CASES TABLE                                                    */
+/*  CASES TABLE                                                    */
 /* ================================================================== */
 
 function CaseDetailRow({ label, value }) {
@@ -1339,14 +1972,12 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
   const [currentPage, setCurrentPage] = useState(0);
   const ITEMS_PER_PAGE = 100;
   
-  // ✅ v2.0: Pagination
   const totalPages = Math.ceil(cases.length / ITEMS_PER_PAGE);
   const paginatedCases = useMemo(() => {
     const start = currentPage * ITEMS_PER_PAGE;
     return cases.slice(start, start + ITEMS_PER_PAGE);
   }, [cases, currentPage]);
   
-  // Reset to first page when cases change
   useEffect(() => {
     setCurrentPage(0);
   }, [cases.length]);
@@ -1361,7 +1992,6 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
   const colCount = 6 + (!compact ? 1 : 0) + (onEdit || onDelete ? 1 : 0);
   
   return React.createElement("div", { className: "flex flex-col gap-3" },
-    // ✅ v2.0: Pagination info
     cases.length > ITEMS_PER_PAGE && React.createElement("div", {
       className: "flex items-center justify-between px-3 py-2 bg-[#FBF9F3] rounded-lg border border-[#E4E1D6]"
     },
@@ -1385,7 +2015,6 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
       )
     ),
     
-    // Table
     React.createElement("div", { className: "overflow-x-auto qa-scroll" },
       React.createElement("table", { className: "w-full text-sm border-collapse min-w-[860px]" },
         React.createElement("thead", null,
@@ -1512,7 +2141,6 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
       )
     ),
     
-    // ✅ v2.0: Bottom pagination
     cases.length > ITEMS_PER_PAGE && React.createElement("div", {
       className: "flex justify-center gap-1"
     },
@@ -1533,7 +2161,7 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
   );
 }
 /* ================================================================== */
-/*  📝 CASE FORM MODAL                                                */
+/*   CASE FORM MODAL                                                */
 /* ================================================================== */
 
 function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
@@ -1559,9 +2187,9 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
   return React.createElement(Modal, {
     title: initial ? "საქმის რედაქტირება" : "ახალი საქმის დამატება",
     onClose: onClose,
-    wide: true
+    size: "xl"
   },
-    React.createElement("div", { className: "grid grid-cols-2 gap-4" },
+    React.createElement("div", { className: "grid grid-cols-2 gap-6" },
       React.createElement(Field, { label: "აუდიტის თარიღი" },
         React.createElement("input", {
           type: "date",
@@ -1661,7 +2289,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
       React.createElement("div", { className: "col-span-2" },
         React.createElement(Field, { label: "გამოვლენილი პრობლემა" },
           React.createElement("textarea", {
-            rows: 2,
+            rows: 6,
             className: inputCls,
             value: form.problem,
             onChange: set("problem")
@@ -1671,7 +2299,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
       React.createElement("div", { className: "col-span-2" },
         React.createElement(Field, { label: "გაცემული რეკომენდაცია" },
           React.createElement("textarea", {
-            rows: 2,
+            rows: 6,
             className: inputCls,
             value: form.recommendation,
             onChange: set("recommendation")
@@ -1697,7 +2325,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
 }
 
 /* ================================================================== */
-/*  👤 EMPLOYEE FORM MODAL                                            */
+/*  EMPLOYEE FORM MODAL                                            */
 /* ================================================================== */
 
 function EmployeeFormModal({ initial, onSave, onClose }) {
@@ -1741,7 +2369,7 @@ function EmployeeFormModal({ initial, onSave, onClose }) {
 }
 
 /* ================================================================== */
-/*  📊 DASHBOARD PAGE                                                 */
+/*  DASHBOARD PAGE                                                 */
 /* ================================================================== */
 
 function DashboardPage({ cases }) {
@@ -1755,8 +2383,10 @@ function DashboardPage({ cases }) {
   
   const years = useMemo(() => {
     const s = new Set(cases.map(c => yearOf(c.incidentDate)).filter(Boolean));
-    [2024, 2025, 2026, 2027, 2028].forEach(y => s.add(y));
-    return Array.from(s).sort();
+    if (s.size === 0) {
+      s.add(new Date().getFullYear());
+    }
+    return Array.from(s).sort((a, b) => b - a);
   }, [cases]);
   
   const filtered = useMemo(() => applyFilters(cases, filters), [cases, filters]);
@@ -1774,7 +2404,7 @@ function DashboardPage({ cases }) {
     React.createElement("div", null,
       React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "ხარისხის კონტროლის დაფა"),
       React.createElement("p", { className: "text-sm text-[#8A8672] mt-0.5" },
-        "აირჩიეთ დღე / კვირა / თვე / კვარტალი / წელი — KPI და დიაგრამები ავტომატურად გადაითვლება."
+        "აირჩიეთ დღე / კვირა / თვე / კვარტალი / წელი. KPI და დიაგრამები ავტომატურად გადაითვლება."
       )
     ),
     React.createElement(FilterBar, { filters, setFilters, years }),
@@ -1797,7 +2427,7 @@ function DashboardPage({ cases }) {
 }
 
 /* ================================================================== */
-/*  📄 CASES PAGE (with Excel Export)                                */
+/*  CASES PAGE (with Excel Export)                                */
 /* ================================================================== */
 
 function CasesPage({ data, saveData }) {
@@ -1818,11 +2448,14 @@ function CasesPage({ data, saveData }) {
   
   const years = useMemo(() => {
     const s = new Set(data.cases.map(c => yearOf(c.incidentDate)).filter(Boolean));
-    [2024, 2025, 2026, 2027, 2028].forEach(y => s.add(y));
-    return Array.from(s).sort();
+    
+    if (s.size === 0) {
+      s.add(new Date().getFullYear());
+    }
+
+    return Array.from(s).sort((a, b) => b - a);
   }, [data.cases]);
   
-    // ✅ v2.0: Pre-built search index
   const searchIndex = useMemo(() => {
     return data.cases.map(c => ({
       id: c.id,
@@ -1841,22 +2474,18 @@ function CasesPage({ data, saveData }) {
   const filtered = useMemo(() => {
     let result = applyFilters(data.cases, timeFilters);
     
-    // Status filter
     if (statusFilter) {
       result = result.filter(c => c.status === statusFilter);
     }
-    
-    // Category filter
+
     if (categoryFilter) {
       result = result.filter(c => c.category === categoryFilter);
     }
-    
-    // Result filter
+
     if (resultFilter) {
       result = result.filter(c => c.auditResult === resultFilter);
     }
-    
-    // ✅ v2.0: Optimized search
+
     if (query) {
       const q = query.toLowerCase();
       const matchingIds = new Set(
@@ -1895,7 +2524,7 @@ function CasesPage({ data, saveData }) {
   };
   
   const exportExcel = async (filteredCases) => {
-    const all = filteredCases;
+    const all = [...filteredCases].sort((a, b) => (a.no || 0) - (b.no || 0));
     const total = all.length;
     const closed = all.filter(c => c.status === "დახურულია").length;
     const open = total - closed;
@@ -1909,7 +2538,6 @@ function CasesPage({ data, saveData }) {
     const PAPER = "FFFBF9F3", WHITE = "FFFFFFFF", BORDERC = "FFDBD7C8", MUTED = "FF8A8672";
     const PIE_COLORS = ["#16213E", "#B8860B", "#C0392B", "#2A4270", "#1F6F50", "#6B7A99", "#8C6B21"];
 
-    // ---- Chart image builders (canvas) ----
     function drawDonutLegend(rows, canvasW, canvasH, titleText) {
         const canvas = document.createElement("canvas");
         canvas.width = canvasW;
@@ -2026,21 +2654,39 @@ function CasesPage({ data, saveData }) {
     wb.creator = "QA აუდიტის პლათფორმა";
     wb.created = new Date();
 
-    // ===== Dashboard sheet =====
     const dash = wb.addWorksheet("დეშბორდი", { views: [{ showGridLines: false }] });
     dash.columns = [
         { width: 3 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 },
         { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 3 }
     ];
 
-    dash.mergeCells("B2:I2");
-    const titleCell = dash.getCell("B2");
-    titleCell.value = "QA აუდიტის პლათფორმა მიმოხილვა";
-    titleCell.font = { size: 18, bold: true, color: { argb: NAVY }, name: "Calibri" };
+    const dashBannerRight = paintExcelBanner(dash, NAVY, 10);
 
-    dash.mergeCells("B3:I3");
-    dash.getCell("B3").value = `შედგენილია: ${formatDate(new Date().toISOString().slice(0, 10))}`;
-    dash.getCell("B3").font = { size: 10, italic: true, color: { argb: MUTED } };
+    const excelGeneratedAt = `${formatDocDate()} ${formatDocTime()}`;
+    const respLines = getResponsiblePersonLines(data);
+    dash.mergeCells(`C2:${dashBannerRight}2`);
+    const respCell = dash.getCell("C2");
+    respCell.value = respLines.primary;
+    respCell.font = { size: 11, bold: true, color: { argb: WHITE } };
+    respCell.alignment = { horizontal: "right", vertical: "middle" };
+
+    dash.mergeCells(`C3:${dashBannerRight}3`);
+    const respSubCell = dash.getCell("C3");
+    respSubCell.value = [respLines.secondary, excelGeneratedAt].filter(Boolean).join("   •   ");
+    respSubCell.font = { size: 9, color: { argb: WHITE } };
+    respSubCell.alignment = { horizontal: "right", vertical: "middle" };
+
+    dash.addImage(wb.addImage({ base64: LOGO_PNG_BASE64, extension: "png" }), {
+        tl: { col: 0.55, row: 1.1 },
+        ext: { width: 180, height: 40 }
+    });
+
+    dash.mergeCells("B4:I4");
+    const sectionTitleCell = dash.getCell("B4");
+    sectionTitleCell.value = "მიმოხილვა";
+    sectionTitleCell.font = { size: 15, bold: true, color: { argb: NAVY }, name: "Calibri" };
+    sectionTitleCell.alignment = { vertical: "middle" };
+    dash.getRow(4).height = 26;
 
     const kpis = [
         ["სულ ქეისი", total, NAVY, "B"],
@@ -2061,7 +2707,6 @@ function CasesPage({ data, saveData }) {
         valueCell.alignment = { vertical: "middle" };
     });
 
-    // Two donuts side by side
     const donutW = 430, donutH = 230;
     const auditImg = drawDonutLegend(auditRows, donutW, donutH, "აუდიტის შედეგი");
     dash.addImage(wb.addImage({ base64: auditImg, extension: "png" }), "B9:E17");
@@ -2069,7 +2714,6 @@ function CasesPage({ data, saveData }) {
     const statusImg = drawDonutLegend(statusRows, donutW, donutH, "სტატუსი");
     dash.addImage(wb.addImage({ base64: statusImg, extension: "png" }), "F9:I17");
 
-    // Bar charts
     let row = 19;
     function barSection(title, rows, rowStart) {
         const h = Math.max(rows.length * 34 + 46, 140);
@@ -2083,33 +2727,68 @@ function CasesPage({ data, saveData }) {
     row = barSection("დახმარების ტიპი", helpRows, row);
     barSection("შეფერხების მიზეზი", delayRows, row);
 
-    // ===== Cases sheet =====
-    const cs = wb.addWorksheet("საქმეები", { views: [{ state: "frozen", ySplit: 1 }] });
+    const cs = wb.addWorksheet("საქმეები", { views: [{ state: "frozen", ySplit: 5 }] });
 
     const headerDefs = [
         ["№", 6],
         ["აუდიტის თარიღი", 15],
         ["ინციდენტის თარიღი", 16],
         ["Jira", 14],
-        ["ოპერატორი", 20],
-        ["დეპარტამენტი", 20],
-        ["კატეგორია", 30],
-        ["დახმარების ტიპი", 16],
-        ["შეფერხების მიზეზი", 22],
-        ["სხვა მიზეზი", 22],
-        ["პრობლემა", 40],
-        ["რეკომენდაცია", 40],
-        ["სტატუსი", 14],
-        ["აუდიტის შედეგი", 14]
+        ["ოპერატორი", 40],
+        ["დეპარტამენტი", 40],
+        ["კატეგორია", 40],
+        ["დახმარების ტიპი", 21],  
+        ["შეფერხების მიზეზი", 40],
+        ["სხვა მიზეზი", 53],
+        ["პრობლემა", 53],
+        ["რეკომენდაცია", 53],
+        ["სტატუსი", 19],       
+        ["აუდიტის შედეგი", 19]   
     ];
+  
+    const centeredCols = new Set([1, 2, 3, 4, 8, 13, 14]);
+    const lastColLetter = String.fromCharCode(64 + headerDefs.length);
 
-    cs.columns = headerDefs.map(([h, w]) => ({ header: h, key: h, width: w }));
+    cs.columns = headerDefs.map(([h, w]) => ({ key: h, width: w }));
 
-    const headerRow = cs.getRow(1);
-    headerRow.eachCell(cell => {
+    const csBannerRight = paintExcelBanner(cs, NAVY, headerDefs.length);
+
+    cs.mergeCells(`C2:${csBannerRight}2`);
+    const csRespCell = cs.getCell("C2");
+    const csRespLines = getResponsiblePersonLines(data);
+    csRespCell.value = csRespLines.primary;
+    csRespCell.font = { size: 11, bold: true, color: { argb: WHITE } };
+    csRespCell.alignment = { horizontal: "right", vertical: "middle" };
+
+    cs.mergeCells(`C3:${csBannerRight}3`);
+    const csExcelGeneratedAt = `${formatDocDate()} ${formatDocTime()}`;
+    const csRespSubCell = cs.getCell("C3");
+    csRespSubCell.value = [csRespLines.secondary, csExcelGeneratedAt].filter(Boolean).join("   •   ");
+    csRespSubCell.font = { size: 9, color: { argb: WHITE } };
+    csRespSubCell.alignment = { horizontal: "right", vertical: "middle" };
+
+    cs.addImage(wb.addImage({ base64: LOGO_PNG_BASE64, extension: "png" }), {
+        tl: { col: 0.55, row: 1.1 },
+        ext: { width: 180, height: 40 }
+    });
+
+    cs.mergeCells(`A4:${lastColLetter}4`);
+    const csSectionTitle = cs.getCell("A4");
+    csSectionTitle.value = "საქმეების ჟურნალი";
+    csSectionTitle.font = { size: 14, bold: true, color: { argb: NAVY }, name: "Calibri" };
+    csSectionTitle.alignment = { vertical: "middle" };
+    cs.getRow(4).height = 24;
+
+    const headerRow = cs.getRow(5);
+    headerDefs.forEach(([label], i) => { headerRow.getCell(i + 1).value = label; });
+    headerRow.eachCell((cell, colNumber) => {
         cell.font = { bold: true, color: { argb: WHITE } };
         cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: NAVY } };
-        cell.alignment = { vertical: "middle", wrapText: true };
+        cell.alignment = {
+            vertical: "middle",
+            horizontal: centeredCols.has(colNumber) ? "center" : "left",
+            wrapText: true
+        };
     });
     headerRow.height = 26;
 
@@ -2133,9 +2812,12 @@ function CasesPage({ data, saveData }) {
         }
 
         r.eachCell((cell, colNumber) => {
-            const colName = headerDefs[colNumber - 1][0];
             cell.border = { bottom: { style: "thin", color: { argb: BORDERC } } };
-            cell.alignment = { vertical: "middle", wrapText: true };
+            cell.alignment = {
+                vertical: "middle",
+                horizontal: centeredCols.has(colNumber) ? "center" : "left",
+                wrapText: true
+            };
         });
 
         const longest = Math.max(
@@ -2148,9 +2830,22 @@ function CasesPage({ data, saveData }) {
     });
 
     cs.autoFilter = {
-        from: "A1",
-        to: `${String.fromCharCode(64 + headerDefs.length)}1`
+        from: "A5",
+        to: `${lastColLetter}5`
     };
+
+    applyExcelPrintSetup(cs, {
+      lastColLetter,
+      lastRow: cs.rowCount,
+      titleRows: "1:5",
+      orientation: "landscape"
+    });
+    applyExcelPrintSetup(dash, {
+      lastColLetter: "J",
+      lastRow: dash.rowCount || 40,
+      titleRows: "1:3",
+      orientation: "landscape"
+    });
 
     const buf = await wb.xlsx.writeBuffer();
     const blob = new Blob([buf], {
@@ -2235,7 +2930,7 @@ function CasesPage({ data, saveData }) {
     React.createElement(FilterBar, { filters: timeFilters, setFilters: setTimeFilters, years }),
     React.createElement("div", { className: "bg-white rounded-lg border border-[#E4E1D6] p-5" },
       React.createElement("p", { className: "text-xs text-[#9A967F] mb-3 italic" },
-        "დააჭირეთ ნებისმიერ ჩანაწერს — გაიხსნება სრული დეტალები."
+        "დააჭირეთ ნებისმიერ ჩანაწერს და გაიხსნება სრული დეტალები."
       ),
       React.createElement(CasesTable, {
         cases: filtered,
@@ -2262,7 +2957,778 @@ function CasesPage({ data, saveData }) {
 }
 
 /* ================================================================== */
-/*  👥 EMPLOYEES PAGE                                                 */
+/*  INCIDENTS (შემთხვევები) form modal                          */
+/* ================================================================== */
+
+function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose }) {
+  const [form, setForm] = useState(initial || {
+    jira: "",
+    employee: "",
+    incidentType: incidentTypes[0] || "",
+    protocolCompliant: false,
+    incomingRequest: "",
+    response: ""
+  });
+
+  const set = k => e => setForm({ ...form, [k]: e.target.value });
+
+  return React.createElement(Modal, {
+    title: initial ? "შემთხვევის რედაქტირება" : "ახალი შემთხვევის დამატება",
+    onClose: onClose,
+    size: "xl"
+  },
+    React.createElement("div", { className: "grid grid-cols-2 gap-6" },
+      React.createElement(Field, { label: "Jira №" },
+        React.createElement("input", {
+          className: inputCls,
+          placeholder: "JIRA-0000",
+          value: form.jira,
+          onChange: set("jira")
+        })
+      ),
+      React.createElement(Field, { label: "თანამშრომელი", hint: "არასავალდებულო" },
+        React.createElement("select", {
+          className: inputCls,
+          value: form.employee,
+          onChange: set("employee")
+        },
+          React.createElement("option", { value: "" }, "— აირჩიე —"),
+          employees.map(e => React.createElement("option", { key: e.id, value: e.name }, e.name))
+        )
+      ),
+      React.createElement("div", { className: "col-span-2" },
+        React.createElement(Field, { label: "შემთხვევა *" },
+          React.createElement("select", {
+            className: inputCls,
+            value: form.incidentType,
+            onChange: set("incidentType")
+          },
+            incidentTypes.map(t => React.createElement("option", { key: t }, t))
+          )
+        )
+      ),
+      React.createElement("div", { className: "col-span-2" },
+        React.createElement("button", {
+          type: "button",
+          onClick: () => setForm({ ...form, protocolCompliant: !form.protocolCompliant }),
+          className: "w-full flex items-center gap-3 px-4 py-3 rounded-md border border-[#EADFB8] bg-[#FBF6E7] hover:bg-[#EFEDE2] transition-colors"
+        },
+          React.createElement(Icon, {
+            name: "star",
+            size: 30,
+            filled: form.protocolCompliant,
+            className: "transition-colors duration-200",
+            style: { color: form.protocolCompliant ? "#FFC107" : "#3A3A32" }
+          }),
+          React.createElement("span", { className: "text-sm font-semibold", style: { color: form.protocolCompliant ? "#FFC107" : "#3A3A32" } },
+            form.protocolCompliant ? "მოხსნა" : "მინიჭება"
+          )
+        )
+      ),
+      React.createElement("div", { className: "col-span-2" },
+        React.createElement(Field, { label: "შემოსული მოთხოვნა" },
+          React.createElement("textarea", {
+            rows: 6,
+            className: inputCls,
+            value: form.incomingRequest,
+            onChange: set("incomingRequest")
+          })
+        )
+      ),
+      React.createElement("div", { className: "col-span-2" },
+        React.createElement(Field, { label: "დაბრუნებული პასუხი" },
+          React.createElement("textarea", {
+            rows: 6,
+            className: inputCls,
+            value: form.response,
+            onChange: set("response")
+          })
+        )
+      )
+    ),
+    React.createElement("div", { className: "flex justify-end gap-2 mt-6" },
+      React.createElement("button", {
+        onClick: onClose,
+        className: "px-4 py-2 rounded-md text-sm font-semibold text-[#6B6A5C] hover:bg-[#EFEDE2]"
+      }, "გაუქმება"),
+      React.createElement("button", {
+        onClick: () => onSave(form),
+        className: "px-4 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057] flex items-center gap-1.5"
+      },
+        React.createElement(Icon, { name: "check", size: 15 }),
+        " შენახვა"
+      )
+    )
+  );
+}
+
+/* ================================================================== */
+/*  INCIDENTS TABLE (expandable rows)                              */
+/* ================================================================== */
+
+function IncidentsTable({ incidents, onEdit, onDelete, onPrint }) {
+  const [expanded, setExpanded] = useState(null);
+  const [currentPage, setCurrentPage] = useState(0);
+  const ITEMS_PER_PAGE = 100;
+
+  const totalPages = Math.ceil(incidents.length / ITEMS_PER_PAGE);
+  const paginatedIncidents = useMemo(() => {
+    const start = currentPage * ITEMS_PER_PAGE;
+    return incidents.slice(start, start + ITEMS_PER_PAGE);
+  }, [incidents, currentPage]);
+
+  useEffect(() => {
+    setCurrentPage(0);
+  }, [incidents.length]);
+
+  if (incidents.length === 0) {
+    return React.createElement("div", { className: "text-center py-14 text-[#9A967F]" },
+      React.createElement(Icon, { name: "task_alt", className: "mx-auto mb-2 opacity-40", size: 30 }),
+      React.createElement("p", { className: "text-sm italic" }, "შემთხვევები არ მოიძებნა")
+    );
+  }
+
+  const Pager = () => React.createElement("div", {
+    className: "flex items-center justify-between px-3 py-2 bg-[#FBF9F3] rounded-lg border border-[#E4E1D6]"
+  },
+    React.createElement("span", { className: "text-xs text-[#8A8672]" },
+      `ნაჩვენებია ${currentPage * ITEMS_PER_PAGE + 1}-${Math.min((currentPage + 1) * ITEMS_PER_PAGE, incidents.length)} / ${incidents.length} ჩანაწერი`
+    ),
+    React.createElement("div", { className: "flex gap-1" },
+      React.createElement("button", {
+        disabled: currentPage === 0,
+        onClick: () => setCurrentPage(p => p - 1),
+        className: "px-3 py-1 text-xs font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40 disabled:cursor-not-allowed"
+      }, "← წინა"),
+      React.createElement("span", { className: "px-3 py-1 text-xs font-semibold text-[#16213E]" },
+        `${currentPage + 1} / ${totalPages}`
+      ),
+      React.createElement("button", {
+        disabled: currentPage >= totalPages - 1,
+        onClick: () => setCurrentPage(p => p + 1),
+        className: "px-3 py-1 text-xs font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40 disabled:cursor-not-allowed"
+      }, "შემდეგი →")
+    )
+  );
+
+  return React.createElement("div", { className: "flex flex-col gap-3" },
+    incidents.length > ITEMS_PER_PAGE && React.createElement(Pager, null),
+    React.createElement("div", { className: "flex flex-col gap-2" },
+    paginatedIncidents.map(inc => {
+      const isOpen = expanded === inc.id;
+      return React.createElement("div", {
+        key: inc.id,
+        className: `qa-fade-up rounded-lg border ${isOpen ? "border-[#EADFB8] bg-[#FBF9F3]" : "border-[#E4E1D6] bg-white"} overflow-hidden`
+      },
+        React.createElement("div", {
+          onClick: () => setExpanded(isOpen ? null : inc.id),
+          className: "flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-[#FBF9F3] transition-colors group"
+        },
+          React.createElement(Icon, {
+            name: "chevron_right",
+            size: 15,
+            className: `transition-transform duration-200 ${isOpen ? "rotate-90" : ""} text-[#B8860B] shrink-0`
+          }),
+          React.createElement(Icon, {
+            name: "star",
+            size: 18,
+            filled: inc.protocolCompliant,
+            className: "shrink-0",
+            style: { color: inc.protocolCompliant ? "#FFC107" : "#D8D4C4" }
+          }),
+          React.createElement("span", { className: "qa-mono text-sm text-[#2A4270] font-semibold shrink-0 min-w-[90px]" },
+            inc.jira
+              ? React.createElement("a", {
+                  href: jiraUrl(inc.jira),
+                  target: "_blank",
+                  rel: "noopener noreferrer",
+                  className: "hover:underline",
+                  onClick: e => e.stopPropagation()
+                }, inc.jira)
+              : "—"
+          ),
+          React.createElement("span", { className: "text-sm text-[#3A3A32] flex-1 min-w-0 truncate" },
+            inc.employee || "თანამშრომელი არ არის მითითებული"
+          ),
+          React.createElement("span", { className: "shrink-0" },
+            React.createElement("span", {
+              className: "qa-stamp qa-serif inline-flex items-center px-2.5 py-1 text-xs font-semibold tracking-wide",
+              style: { color: "#2A4270", background: "#E6EBF4" }
+            }, inc.incidentType || "—")
+          ),
+          React.createElement("div", { className: "flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" },
+            onPrint && React.createElement("button", {
+              onClick: e => { e.stopPropagation(); onPrint(inc); },
+              className: "p-1.5 rounded-md hover:bg-[#E6EBF4] text-[#2A4270]",
+              title: "PDF გენერირება"
+            }, React.createElement(Icon, { name: "picture_as_pdf", size: 14 })),
+            onEdit && React.createElement("button", {
+              onClick: e => { e.stopPropagation(); onEdit(inc); },
+              className: "p-1.5 rounded-md hover:bg-[#E6EBF4] text-[#2A4270]",
+              title: "რედაქტირება"
+            }, React.createElement(Icon, { name: "edit", size: 14 })),
+            onDelete && React.createElement("button", {
+              onClick: e => { e.stopPropagation(); onDelete(inc); },
+              className: "p-1.5 rounded-md hover:bg-[#F6E4E1] text-[#C0392B]",
+              title: "წაშლა"
+            }, React.createElement(Icon, { name: "delete", size: 14 }))
+          )
+        ),
+        React.createElement("div", {
+          className: `grid transition-all duration-300 ease-out ${isOpen ? "grid-rows-[1fr]" : "grid-rows-[0fr]"}`
+        },
+          React.createElement("div", { className: "overflow-hidden" },
+            React.createElement("div", { className: "px-4 pb-4 pt-1 grid grid-cols-1 md:grid-cols-2 gap-4 border-t border-[#EEEBDF]" },
+              React.createElement("div", { className: "flex flex-col gap-1 pt-3" },
+                React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "შემოსული მოთხოვნა"),
+                React.createElement("p", { className: "text-sm text-[#2C2B24]", style: { whiteSpace: "pre-wrap" } }, inc.incomingRequest || "—")
+              ),
+              React.createElement("div", { className: "flex flex-col gap-1 pt-3" },
+                React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "დაბრუნებული პასუხი"),
+                React.createElement("p", { className: "text-sm text-[#2C2B24]", style: { whiteSpace: "pre-wrap" } }, inc.response || "—")
+              )
+            )
+          )
+        )
+      );
+    })
+    ),
+    incidents.length > ITEMS_PER_PAGE && React.createElement(Pager, null)
+  );
+}
+
+/* ================================================================== */
+/*  SHARED DOCUMENT HEADER BANNER (every PDF uses this)            */
+/*  Logo mark is a placeholder using the app's own brand colors      */
+/*  swap DocumentLogoMark's contents for a real <img> once a logo     */
+/*  file is provided; every PDF template already renders through      */
+/*  this one component, so a single edit there updates all of them.   */
+/* ================================================================== */
+
+// Real company logo (ლიბერთი), embedded as a transparent-background PNG so it
+// composites cleanly on the navy header banner in both PDFs and Excel files.
+// Natural size 248x56 (aspect ratio ~4.43:1) scale proportionally wherever used.
+const LOGO_PNG_BASE64 = "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";
+const LOGO_DATA_URL = "data:image/png;base64," + LOGO_PNG_BASE64;
+
+function DocumentLogoMark({ height = 28 }) {
+  const width = Math.round(height * (248 / 56));
+  return React.createElement("img", {
+    src: LOGO_DATA_URL,
+    alt: "ლოგო",
+    style: { height, width, display: "block" }
+  });
+}
+
+function DocumentHeaderBanner({ data, generatedAt }) {
+  const { primary, secondary } = getResponsiblePersonLines(data);
+  return React.createElement("div", {
+    className: "qa-print-header",
+    style: {
+      width: "100%",
+      margin: 0,
+      padding: 0,
+      borderBottom: "4px solid #E65C03",
+      boxSizing: "border-box"
+    }
+  },
+    React.createElement("div", {
+      className: "qa-print-header-inner flex items-center justify-between",
+      style: {
+        background: "#16213E",
+        padding: "10mm 15mm",
+        width: "100%",
+        margin: 0,
+        boxSizing: "border-box"
+      }
+    },
+      React.createElement(DocumentLogoMark, { height: 30 }),
+      React.createElement("div", { className: "text-right" },
+        React.createElement("p", { className: "text-xs font-semibold text-white" }, primary),
+        secondary && React.createElement("p", { className: "text-[11px] text-white", style: { marginTop: 4 } }, secondary),
+        React.createElement("p", { className: "text-[10px] text-white", style: { marginTop: 4 } }, generatedAt)
+      )
+    )
+  );
+}
+
+/* ================================================================== */
+/*  INCIDENT PRINTABLE (single-record PDF via browser print)       */
+/* ================================================================== */
+
+function IncidentPrintable({ incident, generatedAt, data }) {
+  if (!incident) return null;
+  const starColor = incident.protocolCompliant ? "#FFC107" : "#C4C0AE";
+  return React.createElement("div", { className: "qa-print-root hidden print:block text-[#1A1A16]" },
+    React.createElement(DocumentHeaderBanner, { data, generatedAt }),
+    React.createElement("div", { style: { padding: "15mm" } },
+    React.createElement("div", { className: "pb-4 mb-6" },
+      React.createElement("p", { className: "text-[11px] uppercase tracking-[0.16em] text-[#B8860B] font-semibold mb-1" }, "შემთხვევის ბარათი"),
+      React.createElement("h1", { className: "qa-serif text-3xl font-bold text-[#16213E]" }, incident.jira || "Jira № არ არის მითითებული"),
+      React.createElement("p", { className: "text-sm text-[#6B6A5C] mt-1" }, incident.incidentType)
+    ),
+    React.createElement("div", { className: "border border-[#DBD7C8] rounded-lg p-4 mb-4" },
+      React.createElement("p", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "შემთხვევა"),
+      React.createElement("p", { className: "qa-serif text-lg font-bold mt-1 text-[#16213E]" }, incident.incidentType || "—")
+    ),
+    React.createElement("div", { className: "grid grid-cols-3 gap-4 mb-8" },
+      React.createElement("div", { className: "col-span-2 border border-[#DBD7C8] rounded-lg p-4" },
+        React.createElement("p", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "თანამშრომელი"),
+        React.createElement("p", { className: "qa-serif text-lg font-bold mt-1 text-[#16213E]" }, incident.employee || "თანამშრომელი არ არის მითითებული")
+      ),
+      React.createElement("div", {
+        className: "border border-[#DBD7C8] rounded-lg p-4 flex items-center justify-center"
+      },
+        React.createElement(Icon, {
+          name: "star",
+          size: 44,
+          filled: incident.protocolCompliant,
+          style: { color: starColor }
+        })
+      )
+    ),
+    React.createElement("div", { className: "grid grid-cols-1 gap-6" },
+      React.createElement("div", { className: "border border-[#DBD7C8] rounded-lg p-4 break-inside-avoid" },
+        React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E] mb-3" }, "შემოსული მოთხოვნა"),
+        React.createElement("p", { className: "text-sm text-[#3A3A32]", style: { whiteSpace: "pre-wrap" } }, incident.incomingRequest || "—")
+      ),
+      React.createElement("div", { className: "border border-[#DBD7C8] rounded-lg p-4 break-inside-avoid" },
+        React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E] mb-3" }, "დაბრუნებული პასუხი"),
+        React.createElement("p", { className: "text-sm text-[#3A3A32]", style: { whiteSpace: "pre-wrap" } }, incident.response || "—")
+      )
+    )
+    )
+  );
+}
+
+/* ================================================================== */
+/*  INCIDENTS PAGE (შემთხვევები)                                   */
+/* ================================================================== */
+
+function IncidentsPage({ data, saveData }) {
+  const [query, setQuery] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [employeeFilter, setEmployeeFilter] = useState("");
+  const [starFilter, setStarFilter] = useState("");
+  const [editing, setEditing] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [toDelete, setToDelete] = useState(null);
+  const [printId, setPrintId] = useState(null);
+
+  const incidents = data.incidents || [];
+
+  useEffect(() => {
+    if (printId) {
+      const t = setTimeout(() => window.print(), 100);
+      const onAfterPrint = () => setPrintId(null);
+      window.addEventListener("afterprint", onAfterPrint);
+      return () => {
+        clearTimeout(t);
+        window.removeEventListener("afterprint", onAfterPrint);
+      };
+    }
+  }, [printId]);
+
+  const searchIndex = useMemo(() => {
+    return incidents.map(i => ({
+      id: i.id,
+      searchable: [i.jira, i.employee, i.incidentType, i.incomingRequest, i.response]
+        .filter(Boolean).join(' ').toLowerCase()
+    }));
+  }, [incidents]);
+
+  const filtered = useMemo(() => {
+    let result = incidents;
+    if (typeFilter) result = result.filter(i => i.incidentType === typeFilter);
+    if (employeeFilter) {
+      if (employeeFilter === "__none__") {
+        result = result.filter(i => !i.employee);
+      } else {
+        result = result.filter(i => i.employee === employeeFilter);
+      }
+    }
+    if (starFilter === "yes") result = result.filter(i => i.protocolCompliant);
+    if (starFilter === "no") result = result.filter(i => !i.protocolCompliant);
+    if (query) {
+      const q = query.toLowerCase();
+      const matchingIds = new Set(
+        searchIndex.filter(item => item.searchable.includes(q)).map(item => item.id)
+      );
+      result = result.filter(i => matchingIds.has(i.id));
+    }
+    return result.slice().reverse();
+  }, [incidents, typeFilter, employeeFilter, starFilter, query, searchIndex]);
+
+  const filtersActive = Boolean(typeFilter || employeeFilter || starFilter || query);
+
+  const total = filtered.length;
+  const starredCount = filtered.filter(i => i.protocolCompliant).length;
+  const notStarredCount = total - starredCount;
+
+  const typeRows = tally(filtered, "incidentType");
+  const employeeRows = tally(
+    filtered.map(i => ({ employeeLabel: i.employee || "თანამშრომელი არ არის მითითებული" })),
+    "employeeLabel"
+  );
+  const starRows = [
+    ["მინიჭებული", starredCount],
+    ["არ არის მინიჭებული", notStarredCount]
+  ];
+
+  const saveIncident = form => {
+    let list;
+    if (editing) {
+      list = incidents.map(i => i.id === editing.id ? { ...editing, ...form } : i);
+    } else {
+      const no = (incidents.reduce((m, i) => Math.max(m, i.no || 0), 0) || 0) + 1;
+      list = [...incidents, { id: uid(), no, createdAt: new Date().toISOString(), ...form }];
+    }
+    saveData({ ...data, incidents: list });
+    setEditing(null);
+    setAdding(false);
+  };
+
+  const deleteIncident = () => {
+    saveData({ ...data, incidents: incidents.filter(i => i.id !== toDelete.id) });
+    setToDelete(null);
+  };
+
+  const generatedAt = `${formatDocDate()} ${formatDocTime()}`;
+
+  const exportIncidentsExcel = async (list) => {
+    const all = [...list].sort((a, b) => (a.no || 0) - (b.no || 0));
+    const total = all.length;
+    const starred = all.filter(i => i.protocolCompliant).length;
+    const notStarred = total - starred;
+    const typeTally = tally(all, "incidentType");
+    const empTally = tally(
+      all.map(i => ({ employeeLabel: i.employee || "თანამშრომელი არ არის მითითებული" })),
+      "employeeLabel"
+    );
+
+    const { NAVY, GREEN, RED, PAPER, WHITE, BORDERC, MUTED } = EXCEL_COLORS;
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "QA აუდიტის პლათფორმა";
+    wb.created = new Date();
+
+    const dash = wb.addWorksheet("სტატისტიკა", { views: [{ showGridLines: false }] });
+    dash.columns = [
+      { width: 3 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 },
+      { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 3 }
+    ];
+
+    const dashBannerRight = paintExcelBanner(dash, NAVY, 10);
+
+    const excelGeneratedAt = `${formatDocDate()} ${formatDocTime()}`;
+    const respLines = getResponsiblePersonLines(data);
+    dash.mergeCells(`C2:${dashBannerRight}2`);
+    const respCell = dash.getCell("C2");
+    respCell.value = respLines.primary;
+    respCell.font = { size: 11, bold: true, color: { argb: WHITE } };
+    respCell.alignment = { horizontal: "right", vertical: "middle" };
+
+    dash.mergeCells(`C3:${dashBannerRight}3`);
+    const respSubCell = dash.getCell("C3");
+    respSubCell.value = [respLines.secondary, excelGeneratedAt].filter(Boolean).join("   •   ");
+    respSubCell.font = { size: 9, color: { argb: WHITE } };
+    respSubCell.alignment = { horizontal: "right", vertical: "middle" };
+
+    dash.addImage(wb.addImage({ base64: LOGO_PNG_BASE64, extension: "png" }), {
+      tl: { col: 0.55, row: 1.1 },
+      ext: { width: 180, height: 40 }
+    });
+
+    dash.mergeCells("B4:I4");
+    const sectionTitleCell = dash.getCell("B4");
+    sectionTitleCell.value = "შემთხვევების მიმოხილვა";
+    sectionTitleCell.font = { size: 15, bold: true, color: { argb: NAVY }, name: "Calibri" };
+    sectionTitleCell.alignment = { vertical: "middle" };
+    dash.getRow(4).height = 26;
+
+    const kpis = [
+      ["სულ შემთხვევა", total, NAVY, "B"],
+      ["მინიჭებული", starred, GREEN, "E"],
+      ["არ არის მინიჭებული", notStarred, RED, "H"]
+    ];
+
+    kpis.forEach(([label, value, color, col]) => {
+      const nextCol = String.fromCharCode(col.charCodeAt(0) + 1);
+      dash.mergeCells(`${col}5:${nextCol}5`);
+      dash.mergeCells(`${col}6:${nextCol}7`);
+      const labelCell = dash.getCell(`${col}5`);
+      labelCell.value = label;
+      labelCell.font = { size: 10, bold: true, color: { argb: MUTED } };
+      const valueCell = dash.getCell(`${col}6`);
+      valueCell.value = value;
+      valueCell.font = { size: 26, bold: true, color: { argb: color } };
+      valueCell.alignment = { vertical: "middle" };
+    });
+
+    const donutW = 430, donutH = 230;
+    const starImg = chartDrawDonut(starRows, donutW, donutH, "პროტოკოლის შესაბამისობა", ["#1F6F50", "#C0392B"]);
+    dash.addImage(wb.addImage({ base64: starImg, extension: "png" }), "B9:E17");
+
+    const typeImg = chartDrawDonut(typeTally, donutW, donutH, "შემთხვევების ტიპები");
+    dash.addImage(wb.addImage({ base64: typeImg, extension: "png" }), "F9:I17");
+
+    let row = 19;
+    const empImgH = Math.max(empTally.length * 34 + 46, 140);
+    const empImg = chartDrawBar(empTally, 900, empImgH, "თანამშრომლების ჭრილი");
+    const spanRows = Math.max(Math.round(empImgH / 20), 6);
+    dash.addImage(wb.addImage({ base64: empImg, extension: "png" }), `B${row}:I${row + spanRows}`);
+
+    const rs = wb.addWorksheet("ჩანაწერები", { views: [{ state: "frozen", ySplit: 5 }] });
+
+    const headerDefs = [
+      ["№", 6],
+      ["Jira", 14],
+      ["თანამშრომელი", 45],
+      ["შემთხვევა", 45],
+      ["პროტოკოლის შესაბამისობა", 20],
+      ["შემოსული მოთხოვნა", 45],
+      ["დაბრუნებული პასუხი", 45]
+    ];
+    const centeredCols = new Set([1, 2, 5]);
+    const rsLastColLetter = String.fromCharCode(64 + headerDefs.length);
+
+    rs.columns = headerDefs.map(([h, w]) => ({ key: h, width: w }));
+
+    const rsBannerRight = paintExcelBanner(rs, NAVY, headerDefs.length);
+
+    rs.mergeCells(`C2:${rsBannerRight}2`);
+    const rsRespCell = rs.getCell("C2");
+    const rsRespLines = getResponsiblePersonLines(data);
+    rsRespCell.value = rsRespLines.primary;
+    rsRespCell.font = { size: 11, bold: true, color: { argb: WHITE } };
+    rsRespCell.alignment = { horizontal: "right", vertical: "middle" };
+
+    rs.mergeCells(`C3:${rsBannerRight}3`);
+    const rsExcelGeneratedAt = `${formatDocDate()} ${formatDocTime()}`;
+    const rsRespSubCell = rs.getCell("C3");
+    rsRespSubCell.value = [rsRespLines.secondary, rsExcelGeneratedAt].filter(Boolean).join("   •   ");
+    rsRespSubCell.font = { size: 9, color: { argb: WHITE } };
+    rsRespSubCell.alignment = { horizontal: "right", vertical: "middle" };
+
+    rs.addImage(wb.addImage({ base64: LOGO_PNG_BASE64, extension: "png" }), {
+      tl: { col: 0.55, row: 1.1 },
+      ext: { width: 180, height: 40 }
+    });
+
+    rs.mergeCells(`A4:${rsLastColLetter}4`);
+    const rsSectionTitle = rs.getCell("A4");
+    rsSectionTitle.value = "შემთხვევების ჩანაწერები";
+    rsSectionTitle.font = { size: 14, bold: true, color: { argb: NAVY }, name: "Calibri" };
+    rsSectionTitle.alignment = { vertical: "middle" };
+    rs.getRow(4).height = 24;
+
+    const headerRow = rs.getRow(5);
+    headerDefs.forEach(([label], i) => { headerRow.getCell(i + 1).value = label; });
+    headerRow.eachCell((cell, colNumber) => {
+      cell.font = { bold: true, color: { argb: WHITE } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: NAVY } };
+      cell.alignment = {
+        vertical: "middle",
+        horizontal: centeredCols.has(colNumber) ? "center" : "left",
+        wrapText: true
+      };
+    });
+    headerRow.height = 26;
+
+    all.forEach((inc, i) => {
+      const r = rs.addRow([
+        inc.no,
+        inc.jira || "",
+        inc.employee || "თანამშრომელი არ არის მითითებული",
+        inc.incidentType || "",
+        inc.protocolCompliant ? "დიახ ★" : "არა",
+        inc.incomingRequest || "",
+        inc.response || ""
+      ]);
+
+      if (inc.jira && String(inc.jira).trim()) {
+        const cell = r.getCell(2);
+        cell.value = { text: String(inc.jira).trim(), hyperlink: jiraUrl(inc.jira) };
+        cell.font = { color: { argb: "FF0563C1" }, underline: true };
+      }
+
+      const starCell = r.getCell(5);
+      starCell.font = { bold: true, color: { argb: inc.protocolCompliant ? GREEN : RED } };
+
+      if (i % 2 === 1) {
+        r.eachCell(cell => {
+          if (!cell.font || !cell.font.color) {
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: PAPER } };
+          }
+        });
+      }
+
+      r.eachCell((cell, colNumber) => {
+        cell.border = { bottom: { style: "thin", color: { argb: BORDERC } } };
+        cell.alignment = {
+          vertical: "middle",
+          horizontal: centeredCols.has(colNumber) ? "center" : "left",
+          wrapText: true
+        };
+      });
+
+      const longest = Math.max((inc.incomingRequest || "").length, (inc.response || "").length);
+      r.height = longest > 200 ? 120 : longest > 90 ? 70 : longest > 30 ? 34 : 18;
+    });
+
+    rs.autoFilter = {
+      from: "A5",
+      to: `${rsLastColLetter}5`
+    };
+
+    applyExcelPrintSetup(rs, {
+      lastColLetter: rsLastColLetter,
+      lastRow: rs.rowCount,
+      titleRows: "1:5",
+      orientation: "landscape"
+    });
+    applyExcelPrintSetup(dash, {
+      lastColLetter: "J",
+      lastRow: dash.rowCount || 40,
+      titleRows: "1:3",
+      orientation: "landscape"
+    });
+
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `qa-incidents-report-${new Date().toISOString().slice(0, 10)}.xlsx`;
+    a.click();
+  };
+
+  const selectCls = "px-2.5 py-1.5 rounded-md border border-[#DBD7C8] bg-white text-sm text-[#2C2B24] focus:outline-none focus:ring-2 focus:ring-[#B8860B]/40";
+  const printIncident = printId ? incidents.find(i => i.id === printId) : null;
+
+  return React.createElement("div", { className: "flex flex-col gap-6" },
+    React.createElement("div", { className: "qa-noprint flex flex-col gap-6" },
+      React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-3" },
+        React.createElement("div", null,
+          React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "შემთხვევები"),
+          React.createElement("p", { className: "text-sm text-[#8A8672] mt-0.5" },
+            "შემოსული მოთხოვნები, დაბრუნებული პასუხები და პროტოკოლის შესაბამისობა."
+          )
+        ),
+        React.createElement("div", { className: "flex gap-2" },
+          React.createElement("button", {
+            onClick: () => exportIncidentsExcel(filtered),
+            className: "flex items-center gap-1.5 px-3.5 py-2 rounded-md text-sm font-semibold border border-[#DBD7C8] bg-white hover:bg-[#F3F1E7] text-[#3A3A32]",
+            title: filtersActive ? "გატანილი იქნება მხოლოდ გაფილტრული ჩანაწერები" : "გატანილი იქნება ყველა ჩანაწერი"
+          },
+            React.createElement(Icon, { name: "download", size: 15 }),
+            " Excel ",
+            filtersActive && React.createElement("span", {
+              className: "qa-mono text-[10px] bg-[#EADFB8] text-[#8C6B21] px-1.5 py-0.5 rounded-full"
+            }, filtered.length)
+          ),
+          React.createElement("button", {
+            onClick: () => setAdding(true),
+            className: "flex items-center gap-1.5 px-3.5 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057]"
+          },
+            React.createElement(Icon, { name: "add", size: 15 }),
+            " ახალი შემთხვევა"
+          )
+        )
+      ),
+
+      React.createElement("div", { className: "flex flex-wrap gap-3 items-center bg-[#FBF9F3] border border-[#E4E1D6] rounded-lg p-3" },
+        React.createElement("div", { className: "relative flex-1 min-w-[200px]" },
+          React.createElement(Icon, {
+            name: "search",
+            size: 15,
+            className: "absolute left-2.5 top-1/2 -translate-y-1/2 text-[#9A967F]"
+          }),
+          React.createElement("input", {
+            className: "w-full pl-8 pr-3 py-1.5 rounded-md border border-[#DBD7C8] bg-white text-sm focus:outline-none focus:ring-2 focus:ring-[#B8860B]/40",
+            placeholder: "ძებნა: Jira, თანამშრომელი, მოთხოვნა, პასუხი…",
+            value: query,
+            onChange: e => setQuery(e.target.value)
+          })
+        ),
+        React.createElement("select", {
+          className: selectCls,
+          value: typeFilter,
+          onChange: e => setTypeFilter(e.target.value)
+        },
+          React.createElement("option", { value: "" }, "ყველა შემთხვევა"),
+          data.incidentTypes.map(t => React.createElement("option", { key: t }, t))
+        ),
+        React.createElement("select", {
+          className: selectCls,
+          value: employeeFilter,
+          onChange: e => setEmployeeFilter(e.target.value)
+        },
+          React.createElement("option", { value: "" }, "ყველა თანამშრომელი"),
+          React.createElement("option", { value: "__none__" }, "თანამშრომელი არ არის მითითებული"),
+          data.employees.map(e => React.createElement("option", { key: e.id, value: e.name }, e.name))
+        ),
+        React.createElement("select", {
+          className: selectCls,
+          value: starFilter,
+          onChange: e => setStarFilter(e.target.value)
+        },
+          React.createElement("option", { value: "" }, "⭐ ყველა"),
+          React.createElement("option", { value: "yes" }, "⭐ მინიჭებული"),
+          React.createElement("option", { value: "no" }, "არ არის მინიჭებული")
+        )
+      ),
+
+      React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-4" },
+        React.createElement(StatCard, { label: "სულ შემთხვევა", value: total }),
+        React.createElement(StatCard, { label: "მინიჭებული", value: starredCount, accent: "#1F6F50" }),
+        React.createElement(StatCard, { label: "არ არის მინიჭებული", value: notStarredCount, accent: "#C0392B" })
+      ),
+
+      React.createElement(GenericDonut, { rows: starRows, total, colors: ["#1F6F50", "#C0392B"] }),
+
+      React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4" },
+        React.createElement(TallyPanel, { title: "შემთხვევების ტიპები", rows: typeRows, total }),
+        React.createElement(TallyPanel, { title: "თანამშრომლების ჭრილი", rows: employeeRows, total })
+      ),
+
+      React.createElement("div", { className: "bg-white rounded-lg border border-[#E4E1D6] p-5" },
+        React.createElement("p", { className: "text-xs text-[#9A967F] mb-3 italic" },
+          "დააჭირეთ ნებისმიერ ჩანაწერს და გაიხსნება შემოსული მოთხოვნა და დაბრუნებული პასუხი."
+        ),
+        React.createElement(IncidentsTable, {
+          incidents: filtered,
+          onEdit: setEditing,
+          onDelete: setToDelete,
+          onPrint: inc => setPrintId(inc.id)
+        })
+      ),
+
+      (adding || editing) && React.createElement(IncidentFormModal, {
+        initial: editing,
+        incidentTypes: data.incidentTypes,
+        employees: data.employees,
+        onSave: saveIncident,
+        onClose: () => {
+          setEditing(null);
+          setAdding(false);
+        }
+      }),
+
+      toDelete && React.createElement(ConfirmDialog, {
+        text: `ნამდვილად გსურთ შემთხვევა №${String(toDelete.no).padStart(3, "0")} (${toDelete.jira || "Jira არ არის"}) წაშლა? მოქმედება შეუქცევადია.`,
+        onConfirm: deleteIncident,
+        onCancel: () => setToDelete(null)
+      })
+    ),
+
+    printIncident && React.createElement(IncidentPrintable, { incident: printIncident, generatedAt, data })
+  );
+}
+
+/* ================================================================== */
+/*  EMPLOYEES PAGE                                                 */
 /* ================================================================== */
 
 function EmployeesPage({ data, saveData, goToEmployee }) {
@@ -2373,21 +3839,17 @@ function EmployeesPage({ data, saveData, goToEmployee }) {
 }
 
 /* ================================================================== */
-/*  📄 PRINTABLE REPORT (for PDF export)                             */
+/*  PRINTABLE REPORT (for PDF export)                             */
 /* ================================================================== */
 
-function PrintableReport({ kicker, title, subtitle, kpis, panels, generatedAt }) {
-  return React.createElement("div", { className: "hidden print:block p-10 text-[#1A1A16]" },
-    React.createElement("div", { className: "flex items-center justify-between border-b-2 border-[#16213E] pb-4 mb-6" },
-      React.createElement("div", null,
-        React.createElement("p", { className: "text-[11px] uppercase tracking-[0.16em] text-[#B8860B] font-semibold mb-1" }, kicker),
-        React.createElement("h1", { className: "qa-serif text-3xl font-bold text-[#16213E]" }, title),
-        subtitle && React.createElement("p", { className: "text-sm text-[#6B6A5C] mt-1" }, subtitle)
-      ),
-      React.createElement("div", { className: "text-right text-xs text-[#9A967F]" },
-        React.createElement("p", { className: "font-semibold text-[#16213E] qa-serif" }, "QA აუდიტის პლათფორმა"),
-        React.createElement("p", null, "შედგენილია: ", generatedAt)
-      )
+function PrintableReport({ kicker, title, subtitle, kpis, panels, generatedAt, data }) {
+  return React.createElement("div", { className: "qa-print-root hidden print:block text-[#1A1A16]" },
+    React.createElement(DocumentHeaderBanner, { data, generatedAt }),
+    React.createElement("div", { style: { padding: "15mm" } },
+    React.createElement("div", { className: "pb-4 mb-6" },
+      React.createElement("p", { className: "text-[11px] uppercase tracking-[0.16em] text-[#B8860B] font-semibold mb-1" }, kicker),
+      React.createElement("h1", { className: "qa-serif text-3xl font-bold text-[#16213E]" }, title),
+      subtitle && React.createElement("p", { className: "text-sm text-[#6B6A5C] mt-1" }, subtitle)
     ),
     React.createElement("div", { className: "grid grid-cols-3 gap-4 mb-8" },
       kpis.map(k => React.createElement("div", {
@@ -2421,15 +3883,13 @@ function PrintableReport({ kicker, title, subtitle, kpis, panels, generatedAt })
             )
           )
       ))
-    ),
-    React.createElement("p", { className: "text-[10px] text-[#B3AF9C] mt-10 text-center" },
-      "დოკუმენტი გენერირებულია QA აუდიტის პლატფორმიდან • ", generatedAt
+    )
     )
   );
 }
 
 /* ================================================================== */
-/*  👤 EMPLOYEE DETAIL PAGE                                           */
+/*  EMPLOYEE DETAIL PAGE                                           */
 /* ================================================================== */
 
 function EmployeeDetailPage({ data, selected, setSelected }) {
@@ -2443,8 +3903,12 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
   
   const years = useMemo(() => {
     const s = new Set(data.cases.map(c => yearOf(c.incidentDate)).filter(Boolean));
-    [2024, 2025, 2026, 2027, 2028].forEach(y => s.add(y));
-    return Array.from(s).sort();
+    
+    if (s.size === 0) {
+      s.add(new Date().getFullYear());
+    }
+    // ეს ჩანაწერი გაკეთდა დინამიურად წლის გამოთვლისთვის
+    return Array.from(s).sort((a, b) => b - a);
   }, [data.cases]);
   
   const employeeCases = useMemo(() => data.cases.filter(c => c.operator === selected), [data.cases, selected]);
@@ -2454,11 +3918,7 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
   const closed = filtered.filter(c => c.status === "დახურულია").length;
   const open = total - closed;
   
-  const generatedAt = new Date().toLocaleDateString("ka-GE", {
-    year: "numeric",
-    month: "long",
-    day: "numeric"
-  });
+  const generatedAt = `${formatDocDate()} ${formatDocTime()}`;
   
   return React.createElement("div", { className: "flex flex-col gap-6" },
     React.createElement("div", { className: "qa-noprint flex flex-col gap-6" },
@@ -2525,6 +3985,7 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
       title: selected,
       subtitle: data.employees.find(e => e.name === selected)?.role || "",
       generatedAt,
+      data,
       kpis: [
         { label: "სულ ქეისი", value: total },
         { label: "დახურული", value: closed, accent: "#1F6F50" },
@@ -2539,7 +4000,7 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
 }
 
 /* ================================================================== */
-/*  📁 CATEGORY DETAIL PAGE                                           */
+/*  CATEGORY DETAIL PAGE                                           */
 /* ================================================================== */
 
 function CategoryDetailPage({ data, selected, setSelected }) {
@@ -2552,9 +4013,11 @@ function CategoryDetailPage({ data, selected, setSelected }) {
   });
   
   const years = useMemo(() => {
-    const s = new Set(data.cases.map(c => yearOf(c.incidentDate)).filter(Boolean));
-    [2024, 2025, 2026, 2027, 2028].forEach(y => s.add(y));
-    return Array.from(s).sort();
+  const s = new Set(data.cases.map(c => yearOf(c.incidentDate)).filter(Boolean));
+    if (s.size === 0) {
+      s.add(new Date().getFullYear());
+    }
+    return Array.from(s).sort((a, b) => b - a);
   }, [data.cases]);
   
   const categoryCases = useMemo(() => data.cases.filter(c => c.category === selected), [data.cases, selected]);
@@ -2564,11 +4027,7 @@ function CategoryDetailPage({ data, selected, setSelected }) {
   const closed = filtered.filter(c => c.status === "დახურულია").length;
   const open = total - closed;
   
-  const generatedAt = new Date().toLocaleDateString("ka-GE", {
-    year: "numeric",
-    month: "long",
-    day: "numeric"
-  });
+  const generatedAt = `${formatDocDate()} ${formatDocTime()}`;
   
   return React.createElement("div", { className: "flex flex-col gap-6" },
     React.createElement("div", { className: "qa-noprint flex flex-col gap-6" },
@@ -2635,6 +4094,7 @@ function CategoryDetailPage({ data, selected, setSelected }) {
       title: selected,
       subtitle: "",
       generatedAt,
+      data,
       kpis: [
         { label: "სულ ქეისი", value: total },
         { label: "დახურული", value: closed, accent: "#1F6F50" },
@@ -2649,7 +4109,7 @@ function CategoryDetailPage({ data, selected, setSelected }) {
 }
 
 /* ================================================================== */
-/*  ⚙️ SETTINGS PAGE                                                 */
+/*  SETTINGS PAGE                                                 */
 /* ================================================================== */
 
 function ListEditor({ title, items, onAdd, onRemove, hint }) {
@@ -2697,14 +4157,20 @@ function ListEditor({ title, items, onAdd, onRemove, hint }) {
   );
 }
 
-function SettingsPage({ data, saveData, onPlatformReset }) {
+function SettingsPage({
+  data, saveData, onPlatformReset, onPasswordChanged, userEmail,
+  lastBackupAt, onBackupRecorded, getLatestData, onPreparePasswordChange
+}) {
   const fileRef = useRef(null);
   
-  // ✅ v2.0: Modal states
   const [exportModal, setExportModal] = useState(null);
   const [importModal, setImportModal] = useState(null);
   const [alertModal, setAlertModal] = useState(null);
   const [pendingImportFile, setPendingImportFile] = useState(null);
+  const [changePwOpen, setChangePwOpen] = useState(false);
+
+  const backupAgeDays = daysSince(lastBackupAt);
+  const backupIsStale = isBackupStale(lastBackupAt);
   
   const update = (key, items) => saveData({ ...data, [key]: items });
   
@@ -2714,10 +4180,10 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
     { key: "helpTypes", label: "დახმარების ტიპები" },
     { key: "delayReasons", label: "შეფერხების მიზეზები" },
     { key: "statuses", label: "სტატუსები" },
-    { key: "auditResults", label: "აუდიტის შედეგი" }
+    { key: "auditResults", label: "აუდიტის შედეგი" },
+    { key: "incidentTypes", label: "შემთხვევების ტიპები" }
   ];
   
-  // ✅ Export with modal
   const exportJson = () => {
     setExportModal("password");
   };
@@ -2746,12 +4212,13 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
       a.href = URL.createObjectURL(blob);
       a.download = filename;
       a.click();
+      await onBackupRecorded();
       
       setAlertModal({
         type: "success",
         title: "წარმატებული Export",
         message: "დაშიფრული backup შექმნილია!",
-        details: `📦 ${filename}\n🔒 AES-256-GCM დაშიფვრა\n📊 ${data.cases.length} ჩანაწერი`
+        details: `🔒 AES-256-GCM დაშიფვრა\n📊 ${data.cases.length} ჩანაწერი`
       });
       
     } catch (err) {
@@ -2764,7 +4231,6 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
     }
   };
   
-  // ✅ Import with modal
   const importJson = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -2777,19 +4243,17 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
         const parsed = JSON.parse(reader.result);
         
         if (parsed.encrypted === true) {
-          // Encrypted - ask password
           setImportModal({
             type: "encrypted",
             data: parsed
           });
         } else if (parsed.encrypted === false && parsed.data) {
-          // Plain v2.0 format
+
           setImportModal({
             type: "plain-v2",
             data: parsed
           });
         } else if (Array.isArray(parsed.cases)) {
-          // v1.0 format
           setImportModal({
             type: "plain-v1",
             data: parsed
@@ -2848,7 +4312,7 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
           type: "success",
           title: "წარმატებული Import",
           message: "Backup წარმატებით აღდგა!",
-          details: `📊 ჩანაწერები: ${decrypted.cases.length}\n👥 თანამშრომლები: ${decrypted.employees?.length || 0}\n📅 თარიღი: ${parsed.timestamp ? new Date(parsed.timestamp).toLocaleString('ka-GE') : '—'}`
+          details: `ჩანაწერები: ${decrypted.cases.length}\n👥 თანამშრომლები: ${decrypted.employees?.length || 0}\n თარიღი: ${parsed.timestamp ? new Date(parsed.timestamp).toLocaleString('ka-GE') : '—'}`
         });
       } else {
         setAlertModal({
@@ -2874,8 +4338,7 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
     setAlertModal({
       type: "success",
       title: "წარმატებული Import",
-      message: "Backup აღდგა!",
-      details: `⚠️ ეს იყო დაუშიფრავი backup`
+      message: "Backup წარმატებით აღდგა!",
     });
   };
   
@@ -2883,7 +4346,66 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
     React.createElement("div", null,
       React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "პარამეტრები"),
       React.createElement("p", { className: "text-sm text-[#8A8672] mt-0.5" },
-        "მართეთ ჩამოსაშლელი სიები და მონაცემთა სარეზერვო ასლი."
+        "მართეთ ჩამოსაშლელი სიები, ანგარიშის უსაფრთხოება და მონაცემთა სარეზერვო ასლი."
+      )
+    ),
+
+    backupIsStale && React.createElement("div", {
+      className: "flex items-start gap-3 bg-[#FBF6E7] border border-[#EADFB8] rounded-lg p-4"
+    },
+      React.createElement(Icon, { name: "warning", size: 18, className: "text-[#B8860B] shrink-0 mt-0.5" }),
+      React.createElement("div", { className: "flex-1" },
+        React.createElement("p", { className: "text-sm font-semibold text-[#8C6B21]" },
+          lastBackupAt ? `ბოლო სარეზერვო ასლი ${backupAgeDays} დღის წინ გააკეთეთ` : "სარეზერვო ასლი ჯერ არასდროს გაგიკეთებიათ"
+        ),
+        React.createElement("p", { className: "text-xs text-[#8C6B21] mt-0.5" },
+          "მონაცემები ინახება მხოლოდ ამ ბრაუზერში. თუ ბრაუზერის მონაცემები წაიშლება, backup-ის გარეშე აღდგენა შეუძლებელია."
+        )
+      ),
+      React.createElement("button", {
+        onClick: exportJson,
+        className: "shrink-0 px-3 py-1.5 rounded-md text-xs font-semibold bg-[#16213E] text-white hover:bg-[#223057]"
+      }, "Backup ახლავე")
+    ),
+
+    React.createElement("div", { className: "bg-white rounded-lg border border-[#E4E1D6] p-5" },
+      React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E] mb-1" }, "პასუხისმგებელი პირი"),
+      React.createElement("p", { className: "text-xs text-[#8A8672] mb-4" },
+        "მითითებული პასუხისმგებელი პირის მონაცემები ასახული იქნება აპლიკაციიდან გენერირებულ PDF და Excel ფაილებში."
+      ),
+      React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4" },
+        React.createElement(Field, { label: "სახელი, გვარი", hint: "არასავალდებულო" },
+          React.createElement("input", {
+            className: inputCls,
+            placeholder: "მაგ. ნინო მაისურაძე",
+            value: data.responsibleName || "",
+            onChange: e => saveData({ ...data, responsibleName: e.target.value })
+          })
+        ),
+        React.createElement(Field, { label: "პოზიცია", hint: "არასავალდებულო" },
+          React.createElement("input", {
+            className: inputCls,
+            placeholder: "მაგ. ხარისხის კონტროლის მენეჯერი",
+            value: data.responsiblePosition || "",
+            onChange: e => saveData({ ...data, responsiblePosition: e.target.value })
+          })
+        )
+      )
+    ),
+
+    React.createElement("div", { className: "bg-white rounded-lg border border-[#E4E1D6] p-5 flex flex-wrap items-center justify-between gap-3" },
+      React.createElement("div", null,
+        React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E]" }, "ანგარიშის უსაფრთხოება"),
+        React.createElement("p", { className: "text-xs text-[#8A8672] mt-0.5" },
+          userEmail ? `დალოგინებული: ${userEmail}` : "შეცვალეთ ანგარიშის პაროლი."
+        )
+      ),
+      React.createElement("button", {
+        onClick: () => setChangePwOpen(true),
+        className: "flex items-center gap-1.5 px-3.5 py-2 rounded-md text-sm font-semibold border border-[#DBD7C8] bg-white hover:bg-[#F3F1E7]"
+      },
+        React.createElement(Icon, { name: "lock_reset", size: 15 }),
+        " პაროლის შეცვლა"
       )
     ),
     
@@ -2891,7 +4413,9 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
       React.createElement("div", null,
         React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E]" }, "მონაცემთა სარეზერვო ასლი"),
         React.createElement("p", { className: "text-xs text-[#8A8672] mt-0.5" },
-          "გადმოწერეთ ან აღადგინეთ სრული მონაცემთა ბაზა დაშიფრული JSON ფაილით."
+          lastBackupAt
+            ? `ბოლო Backup: ${backupAgeDays === 0 ? "დღეს" : `${backupAgeDays} დღის წინ`} (${formatDateTime(lastBackupAt)})`
+            : "სარეზერვო ასლი ჯერ არასდროს გაგიკეთებიათ."
         )
       ),
       React.createElement("div", { className: "flex gap-2" },
@@ -2928,11 +4452,12 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
         onRemove: v => update(f.key, data[f.key].filter(x => x !== v)),
         hint: f.key === "auditResults"
           ? "სამ სტანდარტულ მნიშვნელობას (სრული/ნაწილობრივი/ხარვეზიანი) ფიქსირებული ფერი აქვს."
+          : f.key === "incidentTypes"
+          ? "ეს სია ივსება „შემთხვევები“ გვერდის ჩამოსაშლელ ველში."
           : null
       }))
     ),
     
-    // ✅ Export password modal
     exportModal === "password" && React.createElement(PasswordPromptModal, {
       title: "📦 Backup Export",
       message: "შეიყვანეთ პაროლი backup-ის დასაშიფრად:\n(შეინახეთ პაროლი რადგან მის გარეშე ვერ შეძლებთ მის გამოყენებას)",
@@ -2941,7 +4466,6 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
       onCancel: () => setExportModal(null)
     }),
     
-    // ✅ Import password modal
     importModal?.type === "encrypted" && React.createElement(PasswordPromptModal, {
       title: "🔐 დაშიფრული Backup",
       message: "შეიყვანეთ backup-ის პაროლი:\n(ის პაროლი რაც Export-ისას გამოიყენეთ)",
@@ -2950,7 +4474,6 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
       onCancel: () => setImportModal(null)
     }),
     
-    // ✅ Import plain v2 confirm
     importModal?.type === "plain-v2" && React.createElement(ConfirmModalCustom, {
       title: "⚠️ დაუშიფრავი Backup",
       message: "ეს არის დაუშიფრავი backup (არაუსაფრთხო ფორმატი).",
@@ -2962,10 +4485,9 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
       onCancel: () => setImportModal(null)
     }),
     
-    // ✅ Import plain v1 confirm
     importModal?.type === "plain-v1" && React.createElement(ConfirmModalCustom, {
-      title: "📦 ძველი ფორმატის Backup",
-      message: "ეს არის v1.0 backup (დაუშიფრავი).",
+      title: "📦 დაუშიფრავი Backup",
+      message: "ეს არის (დაუშიფრავი) backup.",
       details: "გსურთ აღდგენა?",
       icon: "folder_open",
       confirmStyle: "primary",
@@ -2974,24 +4496,40 @@ function SettingsPage({ data, saveData, onPlatformReset }) {
       onCancel: () => setImportModal(null)
     }),
     
-    // ✅ Alert modal
     alertModal && React.createElement(AlertModalCustom, {
       title: alertModal.title,
       message: alertModal.message,
       details: alertModal.details,
       type: alertModal.type,
       onClose: () => setAlertModal(null)
+    }),
+
+    changePwOpen && React.createElement(ChangePasswordModal, {
+      getLatestData: typeof getLatestData === "function" ? getLatestData : () => data,
+      onPrepare: typeof onPreparePasswordChange === "function" ? onPreparePasswordChange : undefined,
+      onClose: () => setChangePwOpen(false),
+      onSuccess: async (newKey) => {
+        await onPasswordChanged(newKey);
+        setChangePwOpen(false);
+        setAlertModal({
+          type: "success",
+          title: "პაროლი შეიცვალა",
+          message: "თქვენი პაროლი წარმატებით განახლდა",
+          details: "მონაცემები ხელახლა დაშიფრულია ახალი პაროლით. სხვა არაფერი შეცვლილა."
+        });
+      }
     })
   );
 }
 
 /* ================================================================== */
-/*  🎛️ SIDEBAR                                                       */
+/*  SIDEBAR                                                       */
 /* ================================================================== */
 
 const NAV = [
   { key: "dashboard", label: "მიმოხილვა", iconName: "dashboard" },
   { key: "cases", label: "საქმეები", iconName: "assignment" },
+  { key: "incidents", label: "შემთხვევები", iconName: "task_alt" },
   { key: "employees", label: "თანამშრომლები", iconName: "group" },
   { key: "employeeDetail", label: "თანამშრომლის დეტალები", iconName: "person_search" },
   { key: "categoryDetail", label: "კატეგორიის დეტალები", iconName: "folder_open" },
@@ -3046,11 +4584,76 @@ function Sidebar({ active, setActive, open, setOpen, caseCount }) {
 }
 
 /* ================================================================== */
-/*  🚀 MAIN APP (Encryption Wrapper)                                 */
+/*  BACKUP REMINDER TOAST                                          */
+/*  Small notification card shown in the bottom-right corner on every  */
+/*  page while logged in, whenever the backup is overdue. Separate     */
+/*  from the larger banner on the Settings page. It has no close       */
+/*  button by design it disappears on its own the moment a backup    */
+/*  is made (lastBackupAt updates and staleness re-evaluates).         */
+/*  Positioning/spacing use inline styles rather than Tailwind         */
+/*  utility classes, since this file ships a hand-curated CSS subset   */
+/*  (not full Tailwind) and only classes already used elsewhere in     */
+/*  the document are guaranteed to exist.                              */
+/* ================================================================== */
+
+function BackupReminderToast({ lastBackupAt, onGoToBackup }) {
+  const stale = isBackupStale(lastBackupAt);
+  if (!stale) return null;
+
+  const ageDays = daysSince(lastBackupAt);
+
+  return React.createElement("div", {
+    className: "qa-noprint qa-fade-up bg-white rounded-lg border border-[#EADFB8] shadow-xl",
+    style: {
+      position: "fixed",
+      bottom: 20,
+      right: 20,
+      zIndex: 50,
+      width: "100%",
+      maxWidth: 300,
+      padding: 14,
+      display: "flex",
+      alignItems: "flex-start",
+      gap: 10
+    }
+  },
+    React.createElement(Icon, {
+      name: "cloud_off",
+      size: 18,
+      className: "text-[#B8860B] shrink-0",
+      style: { marginTop: 2 }
+    }),
+    React.createElement("div", { className: "flex-1 min-w-0" },
+      React.createElement("p", {
+        className: "text-xs font-semibold text-[#8C6B21]",
+        style: { lineHeight: 1.4 }
+      },
+        lastBackupAt ? `Backup ${ageDays} დღეა არ გაგიკეთებიათ` : "Backup ჯერ არასდროს გაგიკეთებიათ"
+      ),
+      React.createElement("p", {
+        className: "text-[11px] text-[#9A967F]",
+        style: { lineHeight: 1.4, marginTop: 4 }
+      },
+        "მონაცემები მხოლოდ ამ ბრაუზერშია. რეკომენდებულია რეგულარული Backup."
+      ),
+      React.createElement("button", {
+        onClick: onGoToBackup,
+        className: "text-xs font-semibold text-[#16213E] hover:text-[#8C6B21] flex items-center gap-1",
+        style: { marginTop: 8 }
+      },
+        React.createElement(Icon, { name: "arrow_forward", size: 13 }),
+        " პარამეტრებზე გადასვლა"
+      )
+    )
+  );
+}
+
+/* ================================================================== */
+/*  MAIN APP (Encryption Wrapper)                                 */
 /* ================================================================== */
 
 function QAAuditPlatform() {
-  const [initState, setInitState] = useState('checking'); // checking | no-user | has-user | logged-in
+  const [initState, setInitState] = useState('checking');
   const [user, setUser] = useState(null);
   const [encryptionKey, setEncryptionKey] = useState(null);
   const [data, setData] = useState(null);
@@ -3060,19 +4663,46 @@ function QAAuditPlatform() {
   const [selectedCategory, setSelectedCategory] = useState("");
   const [saveState, setSaveState] = useState("idle");
   const [loadProgress, setLoadProgress] = useState(0);
+  const [lastBackupAt, setLastBackupAt] = useState(null);
+  const [storagePersisted, setStoragePersisted] = useState(null);
 
   const saveTimer = useRef(null);
   const encryptionKeyRef = useRef(null);
+  const dataRef = useRef(null);
+  const saveEpochRef = useRef(0);
+  const saveInFlightRef = useRef(null);
+  const lastSavedJsonRef = useRef(null);
 
   useEffect(() => {
     encryptionKeyRef.current = encryptionKey;
   }, [encryptionKey]);
 
-  // Initialize storage + restore session after refresh
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
+  const toNonExtractableKey = async (key) => {
+    try {
+      const jwk = await crypto.subtle.exportKey('jwk', key);
+      return await crypto.subtle.importKey(
+        'jwk',
+        jwk,
+        { name: 'AES-GCM', length: 256 },
+        false, 
+        ['encrypt', 'decrypt']
+      );
+    } catch (err) {
+      return key;
+    }
+  };
+
+
   useEffect(() => {
     (async () => {
       try {
         await SecureStorage.init();
+        try { sessionStorage.removeItem('qa_session_key'); } catch (_) {}
+
         const existingUser = await SecureStorage.getUser();
 
         if (!existingUser) {
@@ -3081,44 +4711,6 @@ function QAAuditPlatform() {
         }
 
         setUser(existingUser);
-
-        // Refresh-ზე დალოგინებული დარჩენა sessionStorage-დან
-        const storedKey = sessionStorage.getItem('qa_session_key');
-
-        if (storedKey) {
-          try {
-            const keyData = JSON.parse(storedKey);
-
-            const restoredKey = await crypto.subtle.importKey(
-              'jwk',
-              keyData,
-              { name: 'AES-GCM', length: 256 },
-              true,
-              ['encrypt', 'decrypt']
-            );
-
-            const encrypted = await SecureStorage.getEncryptedData();
-
-            if (encrypted) {
-              const decryptedData = await CryptoModule.decryptData(
-                encrypted.encrypted,
-                encrypted.iv,
-                restoredKey
-              );
-
-              setEncryptionKey(restoredKey);
-              encryptionKeyRef.current = restoredKey;
-              setData(normalizeData(decryptedData));
-              setInitState('logged-in');
-              console.log('[v2.0] Session restored after refresh');
-              return;
-            }
-          } catch (err) {
-            console.warn('[v2.0] Session restore failed. Clearing session.', err);
-            sessionStorage.removeItem('qa_session_key');
-          }
-        }
-
         setInitState('has-user');
       } catch (err) {
         console.error('Storage init error:', err);
@@ -3127,70 +4719,187 @@ function QAAuditPlatform() {
     })();
   }, []);
 
-  const saveSessionKey = async (key) => {
+  const lockKeyInMemory = async (key) => {
     try {
-      const exportedKey = await crypto.subtle.exportKey('jwk', key);
-      sessionStorage.setItem('qa_session_key', JSON.stringify(exportedKey));
-      console.log('[v2.0] Session key saved');
+      const locked = await toNonExtractableKey(key);
+      return locked;
     } catch (err) {
-      console.error('[v2.0] Session key save failed:', err);
+      console.error('[v2.0] lockKeyInMemory failed:', err);
+      return key;
+    }
+  };
+
+  const cancelPendingSave = () => {
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    saveEpochRef.current += 1;
+  };
+
+  const markSaved = (snapshot) => {
+    try {
+      lastSavedJsonRef.current = JSON.stringify(snapshot);
+    } catch (_) {
+      lastSavedJsonRef.current = null;
+    }
+  };
+
+  const isDirty = () => {
+    if (!dataRef.current) return false;
+    if (saveTimer.current) return true;
+    try {
+      return JSON.stringify(dataRef.current) !== lastSavedJsonRef.current;
+    } catch (_) {
+      return true;
+    }
+  };
+
+  const persistNow = async () => {
+    if (!encryptionKeyRef.current || !dataRef.current) return;
+
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+
+    if (saveInFlightRef.current) {
+      try { await saveInFlightRef.current; } catch (_) {}
+    }
+    if (!isDirty()) return;
+
+    const key = encryptionKeyRef.current;
+
+    const epoch = saveEpochRef.current;
+    if (!key || !dataRef.current) return;
+    if (epoch !== saveEpochRef.current) return;
+
+    setSaveState("saving");
+
+    const workPromise = (async () => {
+      try {
+        const toSave = dataRef.current;
+        if (!toSave) return;
+
+        const encryptedPayload = await CryptoModule.encryptData(toSave, key);
+        if (epoch !== saveEpochRef.current) return;
+
+        await SecureStorage.saveEncryptedData(encryptedPayload);
+        if (epoch !== saveEpochRef.current) return;
+
+        markSaved(toSave);
+
+        let stillDirty = false;
+        try {
+          stillDirty = JSON.stringify(dataRef.current) !== JSON.stringify(toSave);
+        } catch (_) {
+          stillDirty = dataRef.current !== toSave;
+        }
+
+        if (stillDirty && epoch === saveEpochRef.current && encryptionKeyRef.current) {
+          setSaveState("saving");
+          if (saveTimer.current) clearTimeout(saveTimer.current);
+          const followEpoch = saveEpochRef.current;
+          saveTimer.current = setTimeout(() => {
+            saveTimer.current = null;
+            if (followEpoch !== saveEpochRef.current) return;
+            persistNow();
+          }, 100);
+        } else {
+          setSaveState("saved");
+          setTimeout(() => {
+            setSaveState(s => (s === "saved" ? "idle" : s));
+          }, 1500);
+        }
+      } catch (err) {
+        console.error('[v2.0] Save failed:', err);
+        setSaveState("error");
+      } finally {
+        if (saveInFlightRef.current === workPromise) {
+          saveInFlightRef.current = null;
+        }
+      }
+    })();
+
+    saveInFlightRef.current = workPromise;
+    await workPromise;
+  };
+
+  const flushPendingSave = () => persistNow();
+
+  const retrySave = () => {
+    if (!encryptionKeyRef.current || !dataRef.current) return;
+    persistNow();
+  };
+
+  const preparePasswordChange = async () => {
+    cancelPendingSave();
+    if (saveInFlightRef.current) {
+      try { await saveInFlightRef.current; } catch (_) {}
     }
   };
 
   const handleLogout = useCallback(() => {
+    cancelPendingSave();
     setEncryptionKey(null);
+    encryptionKeyRef.current = null;
     setData(null);
+    dataRef.current = null;
+    lastSavedJsonRef.current = null;
     setActive("dashboard");
     setInitState('has-user');
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    
-    sessionStorage.removeItem('qa_session_key');
+    setLastBackupAt(null);
   }, []);
 
   const handlePlatformReset = useCallback(async () => {
+    cancelPendingSave();
     await SecureStorage.deleteAllData();
-
-    if (saveTimer.current) clearTimeout(saveTimer.current);
 
     setEncryptionKey(null);
     encryptionKeyRef.current = null;
     setData(null);
+    dataRef.current = null;
+    lastSavedJsonRef.current = null;
     setUser(null);
     setActive("dashboard");
     setSelectedEmployee("");
     setSelectedCategory("");
     setInitState('no-user');
+    setLastBackupAt(null);
+    setStoragePersisted(null);
 
-    sessionStorage.removeItem('qa_session_key');
-    console.log('[v2.0] Platform reset completed');
+    try { sessionStorage.removeItem('qa_session_key'); } catch (_) {}
+
   }, []);
 
   const handleRegistration = async (key, initialData, email) => {
     setLoadProgress(0);
-    setEncryptionKey(key);
-    encryptionKeyRef.current = key;
+    const lockedKey = await lockKeyInMemory(key);
+    setEncryptionKey(lockedKey);
+    encryptionKeyRef.current = lockedKey;
     setLoadProgress(50);
     setData(initialData);
+    dataRef.current = initialData;
+    markSaved(initialData);
     setLoadProgress(100);
     setUser({ email });
     setInitState('logged-in');
-
-    await saveSessionKey(key);
 
     setTimeout(() => setLoadProgress(0), 500);
   };
 
   const handleLogin = async (key, decryptedData, email) => {
     setLoadProgress(0);
-    setEncryptionKey(key);
-    encryptionKeyRef.current = key;
+    const lockedKey = await lockKeyInMemory(key);
+    setEncryptionKey(lockedKey);
+    encryptionKeyRef.current = lockedKey;
     setLoadProgress(50);
     setData(decryptedData);
+    dataRef.current = decryptedData;
+    markSaved(decryptedData);
     setLoadProgress(100);
     setUser({ email });
     setInitState('logged-in');
-
-    await saveSessionKey(key);
 
     setTimeout(() => setLoadProgress(0), 500);
   };
@@ -3199,70 +4908,123 @@ function QAAuditPlatform() {
     if (!encryptionKeyRef.current) return;
 
     setData(nextData);
+    dataRef.current = nextData;
     setSaveState("saving");
 
     if (saveTimer.current) clearTimeout(saveTimer.current);
 
-    saveTimer.current = setTimeout(async () => {
-      try {
-        const encryptedPayload = await CryptoModule.encryptData(nextData, encryptionKeyRef.current);
-        await SecureStorage.saveEncryptedData(encryptedPayload);
-        setSaveState("saved");
-        setTimeout(() => setSaveState("idle"), 1500);
-      } catch (err) {
-        console.error('Save error:', err);
-        setSaveState("idle");
-      }
+    const epochAtSchedule = saveEpochRef.current;
+
+    saveTimer.current = setTimeout(() => {
+      saveTimer.current = null;
+      if (epochAtSchedule !== saveEpochRef.current) return;
+      if (!encryptionKeyRef.current || !dataRef.current) return;
+      persistNow();
     }, 350);
   };
 
-  // Auto-save every 5 minutes
   useEffect(() => {
     if (data && encryptionKey) {
       const autoSaveInterval = setInterval(() => {
-        if (saveState === "idle") {
-          console.log('[v2.0] Auto-save triggered');
-          saveData(data);
+        if (isDirty() && encryptionKeyRef.current && dataRef.current) {
+          flushPendingSave();
         }
       }, 5 * 60 * 1000);
 
       return () => clearInterval(autoSaveInterval);
     }
-  }, [data, encryptionKey, saveState]);
+  }, [data, encryptionKey]);
 
-  // beforeunload emergency save
+
   useEffect(() => {
-    const handleBeforeUnload = (e) => {
-      if (saveTimer.current && encryptionKeyRef.current && data) {
-        e.preventDefault();
-        e.returnValue = '';
-
-        clearTimeout(saveTimer.current);
-
-        CryptoModule.encryptData(data, encryptionKeyRef.current)
-          .then(encryptedPayload => SecureStorage.saveEncryptedData(encryptedPayload))
-          .then(() => console.log('[v2.0] Emergency save completed'))
-          .catch(err => console.error('[v2.0] Emergency save failed:', err));
+    const handleVisibilityOrHide = () => {
+      if (document.visibilityState === 'hidden' || document.hidden) {
+        if (isDirty()) flushPendingSave();
       }
     };
 
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [data]);
+    const handlePageHide = () => {
+      if (isDirty()) flushPendingSave();
+    };
 
-  // Memory cleanup on logout
+    const handleBeforeUnload = (e) => {
+      if (isDirty()) {
+
+        flushPendingSave();
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityOrHide);
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityOrHide);
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, []);
+
   useEffect(() => {
     if (initState === 'has-user' && !encryptionKey) {
       setData(null);
+      dataRef.current = null;
+      lastSavedJsonRef.current = null;
       setSelectedEmployee("");
       setSelectedCategory("");
 
       if (typeof window !== 'undefined' && window.gc) {
-        console.log('[v2.0] Triggering garbage collection');
         window.gc();
       }
     }
   }, [initState, encryptionKey]);
+
+  const handlePasswordChanged = useCallback(async (newEncryptionKey) => {
+    cancelPendingSave();
+    if (saveInFlightRef.current) {
+      try { await saveInFlightRef.current; } catch (_) { /* ignore */ }
+    }
+    const lockedKey = await lockKeyInMemory(newEncryptionKey);
+    setEncryptionKey(lockedKey);
+    encryptionKeyRef.current = lockedKey;
+    if (dataRef.current) markSaved(dataRef.current);
+    setSaveState("idle");
+  }, []);
+
+  const refreshBackupStatus = useCallback(async () => {
+    try {
+      const u = await SecureStorage.getUser();
+      setLastBackupAt(u?.lastBackupAt || null);
+    } catch (e) {
+      console.warn('[backup] status check failed', e);
+    }
+  }, []);
+
+  const recordBackupDone = useCallback(async () => {
+    try {
+      const u = await SecureStorage.getUser();
+      if (!u) return;
+      const nowIso = new Date().toISOString();
+      await SecureStorage.saveUser({ ...u, lastBackupAt: nowIso });
+      setLastBackupAt(nowIso);
+    } catch (e) {
+      console.warn('[backup] could not record backup timestamp', e);
+    }
+  }, []);
+
+  const requestPersist = useCallback(async () => {
+    const result = await PersistentStorage.request();
+    setStoragePersisted(result);
+    return result;
+  }, []);
+
+  useEffect(() => {
+    if (initState === 'logged-in') {
+      refreshBackupStatus();
+      requestPersist();
+    }
+  }, [initState, refreshBackupStatus, requestPersist]);
 
   const goToEmployee = name => {
     setSelectedEmployee(name);
@@ -3312,6 +5074,11 @@ function QAAuditPlatform() {
   return React.createElement("div", { className: "qa-root flex bg-[#F3F1E7] min-h-screen" },
     React.createElement(FontStyles, null),
 
+    React.createElement(BackupReminderToast, {
+      lastBackupAt,
+      onGoToBackup: () => setActive("settings")
+    }),
+
     React.createElement(Sidebar, {
       active,
       setActive,
@@ -3351,6 +5118,18 @@ function QAAuditPlatform() {
             "შენახულია"
           ),
 
+          saveState === "error" && React.createElement("span", {
+            className: "text-[#C0392B] flex items-center gap-1.5"
+          },
+            React.createElement(Icon, { name: "error", size: 12 }),
+            React.createElement("span", null, "შენახვა ვერ მოხერხდა"),
+            React.createElement("button", {
+              type: "button",
+              onClick: retrySave,
+              className: "ml-1 px-2 py-0.5 rounded border border-[#C0392B]/40 bg-[#C0392B]/10 hover:bg-[#C0392B]/20 font-semibold text-[#C0392B]"
+            }, "ხელახლა ცდა")
+          ),
+
           React.createElement("button", {
             onClick: handleLogout,
             className: "flex items-center gap-1 text-[#9A967F] hover:text-[#C0392B] font-semibold"
@@ -3369,6 +5148,11 @@ function QAAuditPlatform() {
         }),
 
         active === "cases" && React.createElement(CasesPage, {
+          data,
+          saveData
+        }),
+
+        active === "incidents" && React.createElement(IncidentsPage, {
           data,
           saveData
         }),
@@ -3394,18 +5178,81 @@ function QAAuditPlatform() {
         active === "settings" && React.createElement(SettingsPage, {
           data,
           saveData,
-          onPlatformReset: handlePlatformReset
+          onPlatformReset: handlePlatformReset,
+          onPasswordChanged: handlePasswordChanged,
+          userEmail: user?.email || "",
+          lastBackupAt,
+          onBackupRecorded: recordBackupDone,
+          getLatestData: () => dataRef.current,
+          onPreparePasswordChange: preparePasswordChange
         })
       )
     )
   );
 }
 /* ================================================================== */
-/*  🎬 RENDER APP                                                     */
+/*   ERROR BOUNDARY (guards against a blank white screen)           */
+/*  Purely defensive UI never touches storage or encryption state,   */
+/*  so it cannot introduce any data-loss risk. On a render crash it    */
+/*  offers a reload (safe: IndexedDB data is untouched by a reload).  */
+/* ================================================================== */
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error('[AppErrorBoundary] caught render error:', error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return React.createElement("div", {
+        className: "qa-root min-h-screen flex items-center justify-center bg-[#F3F1E7] p-6"
+      },
+        React.createElement(FontStyles, null),
+        React.createElement("div", {
+          className: "w-full max-w-md bg-white rounded-xl border border-[#E4E1D6] shadow-2xl p-8 flex flex-col items-center gap-4 text-center"
+        },
+          React.createElement("div", { className: "w-12 h-12 rounded-lg bg-[#F6E4E1] flex items-center justify-center" },
+            React.createElement(Icon, { name: "error", size: 24, className: "text-[#C0392B]" })
+          ),
+          React.createElement("h1", { className: "qa-serif text-lg font-bold text-[#16213E]" }, "მოულოდნელი შეცდომა"),
+          React.createElement("p", { className: "text-sm text-[#6B6A5C]" },
+            "ინტერფეისმა შეცდომა დაუშვა, მაგრამ თქვენი დაშიფრული მონაცემები ხელუხლებელია ეს იყო მხოლოდ ეკრანის ჩვენების პრობლემა."
+          ),
+          React.createElement("button", {
+            onClick: () => window.location.reload(),
+            className: "px-4 py-2.5 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057] flex items-center gap-2"
+          },
+            React.createElement(Icon, { name: "refresh", size: 15 }),
+            " გვერდის განახლება"
+          ),
+          this.state.error && React.createElement("p", {
+            className: "text-[10px] text-[#B3AF9C] qa-mono mt-2",
+            style: { wordBreak: "break-all" }
+          }, String(this.state.error.message || this.state.error))
+        )
+      );
+    }
+    return this.props.children;
+  }
+}
+
+/* ================================================================== */
+/*  RENDER APP                                                     */
 /* ================================================================== */
 
 const rootEl = document.getElementById("root");
-ReactDOM.createRoot(rootEl).render(React.createElement(QAAuditPlatform, null));
+ReactDOM.createRoot(rootEl).render(
+  React.createElement(AppErrorBoundary, null, React.createElement(QAAuditPlatform, null))
+);
 document.getElementById("boot-loader").remove();
 
 } catch (err) {
