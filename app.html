@@ -1056,12 +1056,12 @@ function GenericDonut({ rows, total, colors }) {
   );
 }
 
-function Modal({ title, onClose, children, wide, size }) {
+function Modal({ title, onClose, children, wide, size, closeOnBackdrop = true }) {
   const maxWidthPx = size === "xl" ? 860 : size === "lg" ? 720 : wide ? 672 : 448;
   const roomy = size === "xl";
   return React.createElement("div", {
     className: "fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#16213E]/50 backdrop-blur-[2px]",
-    onClick: onClose
+    onClick: closeOnBackdrop ? onClose : undefined
   },
     React.createElement("div", {
       className: "qa-fade-up bg-[#FBF9F3] rounded-xl shadow-2xl w-full max-h-[88vh] overflow-y-auto qa-scroll",
@@ -2187,6 +2187,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
   return React.createElement(Modal, {
     title: initial ? "საქმის რედაქტირება" : "ახალი საქმის დამატება",
     onClose: onClose,
+    closeOnBackdrop: false,
     size: "xl"
   },
     React.createElement("div", { className: "grid grid-cols-2 gap-6" },
@@ -2975,6 +2976,7 @@ function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose 
   return React.createElement(Modal, {
     title: initial ? "შემთხვევის რედაქტირება" : "ახალი შემთხვევის დამატება",
     onClose: onClose,
+    closeOnBackdrop: false,
     size: "xl"
   },
     React.createElement("div", { className: "grid grid-cols-2 gap-6" },
