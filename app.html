@@ -494,38 +494,346 @@ const SEED_DATA = {
   responsiblePosition: ""
 };
 
-function normalizeData(raw) {
-  const safeArr = (v, fallback) => Array.isArray(v) ? v : fallback;
-  const safeStr = (v) => typeof v === "string" ? v : "";
-  return {
-    categories: safeArr(raw?.categories, SEED_DATA.categories),
-    departments: safeArr(raw?.departments, SEED_DATA.departments),
-    helpTypes: safeArr(raw?.helpTypes, SEED_DATA.helpTypes),
-    delayReasons: safeArr(raw?.delayReasons, SEED_DATA.delayReasons),
-    statuses: safeArr(raw?.statuses, SEED_DATA.statuses),
-    auditResults: safeArr(raw?.auditResults, SEED_DATA.auditResults),
-    incidentTypes: safeArr(raw?.incidentTypes, SEED_DATA.incidentTypes),
-    employees: safeArr(raw?.employees, SEED_DATA.employees),
-    cases: safeArr(raw?.cases, SEED_DATA.cases),
-    incidents: safeArr(raw?.incidents, SEED_DATA.incidents),
-    responsibleName: safeStr(raw?.responsibleName),
-    responsiblePosition: safeStr(raw?.responsiblePosition)
-  };
-}
+/* ================================================================== */
+/*  ID-BASED REFERENCE DATA (stable keys; labels are editable)       */
+/*  Cases/incidents store *Id fields. Display/Excel/PDF resolve       */
+/*  labels via labelOf(). Rename never splits charts or stats.        */
+/* ================================================================== */
+
+const KNOWN_STATUS_IDS = {
+  "დახურულია": "st_closed",
+  "დახურული": "st_closed",
+  "მიმდინარეობს": "st_progress",
+  "განხილვაშია": "st_review"
+};
+
+const KNOWN_AUDIT_IDS = {
+  "სრული": "ar_full",
+  "ნაწილობრივი": "ar_partial",
+  "ხარვეზიანი": "ar_defect"
+};
 
 const STATUS_COLOR = {
+  st_closed:   { fg: "#1F6F50", bg: "#E4F1EA", ring: "#1F6F50" },
+  st_progress: { fg: "#B8860B", bg: "#FBF1DA", ring: "#B8860B" },
+  st_review:   { fg: "#2A4270", bg: "#E6EBF4", ring: "#2A4270" },
+  // legacy label keys (pre-migration reads)
   "დახურულია": { fg: "#1F6F50", bg: "#E4F1EA", ring: "#1F6F50" },
   "მიმდინარეობს": { fg: "#B8860B", bg: "#FBF1DA", ring: "#B8860B" },
   "განხილვაშია": { fg: "#2A4270", bg: "#E6EBF4", ring: "#2A4270" }
 };
 
 const AUDIT_RESULT_COLOR = {
+  ar_full:    { fg: "#1F6F50", bg: "#E4F1EA", ring: "#1F6F50" },
+  ar_partial: { fg: "#B8860B", bg: "#FBF1DA", ring: "#B8860B" },
+  ar_defect:  { fg: "#C0392B", bg: "#F6E4E1", ring: "#C0392B" },
   "სრული": { fg: "#1F6F50", bg: "#E4F1EA", ring: "#1F6F50" },
   "ნაწილობრივი": { fg: "#B8860B", bg: "#FBF1DA", ring: "#B8860B" },
   "ხარვეზიანი": { fg: "#C0392B", bg: "#F6E4E1", ring: "#C0392B" }
 };
 
 const TALLY_PALETTE = ["#16213E", "#2A4270", "#B8860B", "#C0392B", "#1F6F50", "#6B7A99", "#8C6B21"];
+
+function newRefId(prefix) {
+  return (prefix || "ref") + "_" + Math.random().toString(36).slice(2, 10);
+}
+
+function labelOf(list, id) {
+  if (!id) return "";
+  if (!Array.isArray(list)) return String(id);
+  const hit = list.find(x => x && x.id === id);
+  return hit ? hit.label : String(id);
+}
+
+function findInList(list, idOrLabel) {
+  if (!idOrLabel || !Array.isArray(list)) return null;
+  return list.find(x => x && (x.id === idOrLabel || x.label === idOrLabel)) || null;
+}
+
+function ensureIdList(arr, knownMap) {
+  knownMap = knownMap || {};
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  const seenIds = new Set();
+  const seenLabels = new Set();
+  let defaultAssigned = false;
+
+  arr.forEach(item => {
+    let id, label, isDefault = false;
+    if (typeof item === "string") {
+      label = item.trim();
+      if (!label) return;
+      id = knownMap[label] || newRefId("ref");
+    } else if (item && typeof item === "object") {
+      label = String(item.label || item.name || "").trim();
+      if (!label) return;
+      id = item.id || knownMap[label] || newRefId("ref");
+      isDefault = item.isDefault === true;
+    } else {
+      return;
+    }
+    // merge typo variants into known stable ids
+    if (knownMap[label]) id = knownMap[label];
+    if (seenIds.has(id) || seenLabels.has(label)) return;
+    seenIds.add(id);
+    seenLabels.add(label);
+    // only one default per list
+    if (isDefault && defaultAssigned) isDefault = false;
+    if (isDefault) defaultAssigned = true;
+    out.push({ id, label, isDefault: !!isDefault });
+  });
+  return out;
+}
+
+function getDefaultId(list) {
+  if (!Array.isArray(list)) return "";
+  const hit = list.find(x => x && x.isDefault);
+  return hit ? hit.id : "";
+}
+
+/** Toggle default: click same id clears; otherwise only that id is default. */
+function setDefaultInList(list, id) {
+  if (!Array.isArray(list)) return [];
+  const current = list.find(x => x && x.isDefault);
+  const clearing = current && current.id === id;
+  return list.map(x => ({
+    ...x,
+    isDefault: clearing ? false : x.id === id
+  }));
+}
+
+function ensureEmployees(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map(e => {
+    if (!e || typeof e !== "object") return null;
+    const name = String(e.name || "").trim();
+    if (!name) return null;
+    return {
+      id: e.id || newRefId("emp"),
+      name,
+      role: typeof e.role === "string" ? e.role : ""
+    };
+  }).filter(Boolean);
+}
+
+function resolveRefId(list, value, knownMap) {
+  if (!value) return "";
+  const found = findInList(list, value);
+  if (found) return found.id;
+  if (knownMap && knownMap[value]) return knownMap[value];
+  return "";
+}
+
+function ensureRefOnList(list, label, knownMap) {
+  if (!label) return { list, id: "" };
+  const existing = findInList(list, label);
+  if (existing) return { list, id: existing.id };
+  const id = (knownMap && knownMap[label]) || newRefId("ref");
+  return { list: [...list, { id, label }], id };
+}
+
+function migrateCase(c, ctx) {
+  if (!c || typeof c !== "object") return null;
+
+  let { statuses, categories, departments, helpTypes, delayReasons, auditResults, employees } = ctx;
+
+  const pick = (list, idField, legacyField, knownMap) => {
+    if (c[idField] && findInList(list, c[idField])) return { list, id: c[idField] };
+    const legacy = c[legacyField] || c[idField] || "";
+    if (!legacy) return { list, id: "" };
+    const resolved = resolveRefId(list, legacy, knownMap);
+    if (resolved) return { list, id: resolved };
+    const added = ensureRefOnList(list, String(legacy), knownMap);
+    return added;
+  };
+
+  let r;
+  r = pick(statuses, "statusId", "status", KNOWN_STATUS_IDS);
+  statuses = r.list; const statusId = r.id;
+
+  r = pick(categories, "categoryId", "category", null);
+  categories = r.list; const categoryId = r.id;
+
+  r = pick(departments, "departmentId", "department", null);
+  departments = r.list; const departmentId = r.id;
+
+  r = pick(helpTypes, "helpTypeId", "helpType", null);
+  helpTypes = r.list; const helpTypeId = r.id;
+
+  r = pick(delayReasons, "delayReasonId", "delayReason", null);
+  delayReasons = r.list; const delayReasonId = r.id;
+
+  r = pick(auditResults, "auditResultId", "auditResult", KNOWN_AUDIT_IDS);
+  auditResults = r.list; const auditResultId = r.id;
+
+  let operatorId = c.operatorId || "";
+  if (operatorId && !employees.find(e => e.id === operatorId)) operatorId = "";
+  if (!operatorId && c.operator) {
+    const emp = employees.find(e => e.name === c.operator);
+    if (emp) operatorId = emp.id;
+    else {
+      const id = newRefId("emp");
+      employees = [...employees, { id, name: String(c.operator), role: "" }];
+      operatorId = id;
+    }
+  }
+
+  ctx.statuses = statuses;
+  ctx.categories = categories;
+  ctx.departments = departments;
+  ctx.helpTypes = helpTypes;
+  ctx.delayReasons = delayReasons;
+  ctx.auditResults = auditResults;
+  ctx.employees = employees;
+
+  return {
+    ...c,
+    statusId,
+    categoryId,
+    departmentId,
+    helpTypeId,
+    delayReasonId,
+    auditResultId,
+    operatorId,
+    // keep legacy string fields in sync for any leftover readers / exports safety
+    status: labelOf(statuses, statusId),
+    category: labelOf(categories, categoryId),
+    department: labelOf(departments, departmentId),
+    helpType: labelOf(helpTypes, helpTypeId),
+    delayReason: labelOf(delayReasons, delayReasonId),
+    auditResult: labelOf(auditResults, auditResultId),
+    operator: (employees.find(e => e.id === operatorId) || {}).name || ""
+  };
+}
+
+function migrateIncident(inc, ctx) {
+  if (!inc || typeof inc !== "object") return null;
+  let { incidentTypes, employees } = ctx;
+
+  let incidentTypeId = inc.incidentTypeId || "";
+  if (incidentTypeId && !findInList(incidentTypes, incidentTypeId)) incidentTypeId = "";
+  if (!incidentTypeId && inc.incidentType) {
+    const found = findInList(incidentTypes, inc.incidentType);
+    if (found) incidentTypeId = found.id;
+    else {
+      const id = newRefId("ref");
+      incidentTypes = [...incidentTypes, { id, label: String(inc.incidentType) }];
+      incidentTypeId = id;
+    }
+  }
+
+  let employeeId = inc.employeeId || "";
+  if (employeeId && !employees.find(e => e.id === employeeId)) employeeId = "";
+  if (!employeeId && inc.employee) {
+    const emp = employees.find(e => e.name === inc.employee);
+    if (emp) employeeId = emp.id;
+    else {
+      const id = newRefId("emp");
+      employees = [...employees, { id, name: String(inc.employee), role: "" }];
+      employeeId = id;
+    }
+  }
+
+  ctx.incidentTypes = incidentTypes;
+  ctx.employees = employees;
+
+  return {
+    ...inc,
+    incidentTypeId,
+    employeeId,
+    incidentType: labelOf(incidentTypes, incidentTypeId),
+    employee: (employees.find(e => e.id === employeeId) || {}).name || ""
+  };
+}
+
+function normalizeData(raw) {
+  const safeArr = (v, fallback) => Array.isArray(v) ? v : fallback;
+  const safeStr = (v) => typeof v === "string" ? v : "";
+
+  const ctx = {
+    categories: ensureIdList(safeArr(raw?.categories, [])),
+    departments: ensureIdList(safeArr(raw?.departments, [])),
+    helpTypes: ensureIdList(safeArr(raw?.helpTypes, [])),
+    delayReasons: ensureIdList(safeArr(raw?.delayReasons, [])),
+    statuses: ensureIdList(safeArr(raw?.statuses, []), KNOWN_STATUS_IDS),
+    auditResults: ensureIdList(safeArr(raw?.auditResults, []), KNOWN_AUDIT_IDS),
+    incidentTypes: ensureIdList(safeArr(raw?.incidentTypes, [])),
+    employees: ensureEmployees(safeArr(raw?.employees, []))
+  };
+
+  const cases = safeArr(raw?.cases, []).map(c => migrateCase(c, ctx)).filter(Boolean);
+  const incidents = safeArr(raw?.incidents, []).map(i => migrateIncident(i, ctx)).filter(Boolean);
+
+  return {
+    categories: ctx.categories,
+    departments: ctx.departments,
+    helpTypes: ctx.helpTypes,
+    delayReasons: ctx.delayReasons,
+    statuses: ctx.statuses,
+    auditResults: ctx.auditResults,
+    incidentTypes: ctx.incidentTypes,
+    employees: ctx.employees,
+    cases,
+    incidents,
+    responsibleName: safeStr(raw?.responsibleName),
+    responsiblePosition: safeStr(raw?.responsiblePosition)
+  };
+}
+
+/** Re-sync denormalized label fields from current lists (call after rename). */
+function resyncLabels(data) {
+  const cases = (data.cases || []).map(c => ({
+    ...c,
+    status: labelOf(data.statuses, c.statusId),
+    category: labelOf(data.categories, c.categoryId),
+    department: labelOf(data.departments, c.departmentId),
+    helpType: labelOf(data.helpTypes, c.helpTypeId),
+    delayReason: labelOf(data.delayReasons, c.delayReasonId),
+    auditResult: labelOf(data.auditResults, c.auditResultId),
+    operator: (data.employees.find(e => e.id === c.operatorId) || {}).name || ""
+  }));
+  const incidents = (data.incidents || []).map(i => ({
+    ...i,
+    incidentType: labelOf(data.incidentTypes, i.incidentTypeId),
+    employee: (data.employees.find(e => e.id === i.employeeId) || {}).name || ""
+  }));
+  return { ...data, cases, incidents };
+}
+
+function isStatusClosed(c) {
+  return c.statusId === "st_closed" || c.status === "დახურულია" || c.status === "დახურული";
+}
+
+function statusColorFor(nameOrId) {
+  if (nameOrId && STATUS_COLOR[nameOrId]) return STATUS_COLOR[nameOrId];
+  const id = KNOWN_STATUS_IDS[nameOrId];
+  if (id && STATUS_COLOR[id]) return STATUS_COLOR[id];
+  return { fg: "#555", bg: "#eee", ring: "#999" };
+}
+
+function auditColorFor(nameOrId) {
+  if (nameOrId && AUDIT_RESULT_COLOR[nameOrId]) return AUDIT_RESULT_COLOR[nameOrId];
+  const id = KNOWN_AUDIT_IDS[nameOrId];
+  if (id && AUDIT_RESULT_COLOR[id]) return AUDIT_RESULT_COLOR[id];
+  return { fg: "#555", bg: "#eee", ring: "#999" };
+}
+
+function tallyById(list, idKey, labelList, emptyLabel) {
+  const map = {};
+  const labelMap = {};
+  list.forEach(item => {
+    const id = item[idKey] || "";
+    const label = id
+      ? (labelOf(labelList, id) || id)
+      : (emptyLabel || "—");
+    const key = id || "__empty__";
+    map[key] = (map[key] || 0) + 1;
+    labelMap[key] = label;
+  });
+  return Object.keys(map)
+    .map(k => [labelMap[k], map[k]])
+    .sort((a, b) => b[1] - a[1]);
+}
 
 /* ================================================================== */
 /*  REUSABLE EXCEL CHART HELPERS (canvas -> PNG)                   */
@@ -796,7 +1104,7 @@ function getResponsiblePersonLines(data) {
 function tally(list, key) {
   const map = {};
   list.forEach(item => {
-    const v = item[key] || "შეფერხების გარეშე  ✓";
+    const v = item[key] || "შეფერხების გარეშე ✓";
     map[v] = (map[v] || 0) + 1;
   });
   return Object.entries(map).sort((a, b) => b[1] - a[1]);
@@ -912,22 +1220,24 @@ function Field({ label, children, hint }) {
   );
 }
 
-function StatusBadge({ status, size = "md" }) {
-  const c = STATUS_COLOR[status] || { fg: "#555", bg: "#eee" };
+function StatusBadge({ status, statusId, size = "md" }) {
+  const c = statusColorFor(statusId || status);
+  const text = status || statusId || "—";
   const pad = size === "sm" ? "px-2 py-0.5 text-[10px]" : "px-3 py-1 text-xs";
   return React.createElement("span", {
     className: `qa-stamp qa-serif inline-flex items-center gap-1 ${pad} font-semibold tracking-wide uppercase`,
     style: { color: c.fg, background: c.bg }
-  }, status);
+  }, text);
 }
 
-function AuditResultBadge({ value, size = "md" }) {
-  const c = AUDIT_RESULT_COLOR[value] || { fg: "#555", bg: "#eee" };
+function AuditResultBadge({ value, valueId, size = "md" }) {
+  const c = auditColorFor(valueId || value);
+  const text = value || valueId || "—";
   const pad = size === "sm" ? "px-2 py-0.5 text-[10px]" : "px-3 py-1 text-xs";
   return React.createElement("span", {
     className: `qa-stamp qa-serif inline-flex items-center gap-1 ${pad} font-semibold tracking-wide uppercase`,
     style: { color: c.fg, background: c.bg }
-  }, value || "—");
+  }, text);
 }
 
 function StatCard({ label, value, accent, sub }) {
@@ -980,7 +1290,7 @@ function StatusDonut({ rows, total }) {
     const pct = total ? value / total * 100 : 0;
     const start = acc;
     acc += pct;
-    const color = (STATUS_COLOR[name] || {}).ring || TALLY_PALETTE[i % TALLY_PALETTE.length];
+    const color = statusColorFor(name).ring || TALLY_PALETTE[i % TALLY_PALETTE.length];
     return `${color} ${start}% ${acc}%`;
   });
   const gradient = segments.length
@@ -1003,7 +1313,7 @@ function StatusDonut({ rows, total }) {
           React.createElement("span", { className: "flex items-center gap-2 text-[#D7DEEE]" },
             React.createElement("span", {
               className: "w-2 h-2 rounded-full",
-              style: { background: (STATUS_COLOR[name] || {}).ring || "#999" }
+              style: { background: statusColorFor(name).ring }
             }),
             name
           ),
@@ -1680,7 +1990,6 @@ function LoginPage({ userEmail, onLogin, onReset }) {
         const remaining = Math.ceil((lockedUntil - Date.now()) / 1000);
         
         if (remaining <= 0) {
-          // Lockout expired
           setLockedUntil(null);
           setLoginAttempts(0);
           setRemainingSeconds(0);
@@ -1787,6 +2096,7 @@ function LoginPage({ userEmail, onLogin, onReset }) {
             newEncryptedPayload
           );
           encryptionKey = migrated.encryptionKey;
+          console.log('[security] Account migrated to v2 credential scheme');
         } catch (migrationErr) {
           console.warn('[security] v2 migration skipped, will retry next login:', migrationErr);
         }
@@ -1967,20 +2277,30 @@ function CaseDetailRow({ label, value }) {
   );
 }
 
-function CasesTable({ cases, onEdit, onDelete, compact }) {
+function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSelect, onToggleSelectAll, onPageChange, onBulkDelete }) {
   const [expanded, setExpanded] = useState(null);
   const [currentPage, setCurrentPage] = useState(0);
   const ITEMS_PER_PAGE = 100;
+  const selectable = typeof onToggleSelect === "function";
+  const selectedSet = useMemo(() => new Set(selectedIds || []), [selectedIds]);
   
   const totalPages = Math.ceil(cases.length / ITEMS_PER_PAGE);
   const paginatedCases = useMemo(() => {
     const start = currentPage * ITEMS_PER_PAGE;
     return cases.slice(start, start + ITEMS_PER_PAGE);
   }, [cases, currentPage]);
+
+  const pageIds = useMemo(() => paginatedCases.map(c => c.id), [paginatedCases]);
+  const allPageSelected = pageIds.length > 0 && pageIds.every(id => selectedSet.has(id));
+  const somePageSelected = pageIds.some(id => selectedSet.has(id));
   
   useEffect(() => {
     setCurrentPage(0);
   }, [cases.length]);
+
+  useEffect(() => {
+    if (typeof onPageChange === "function") onPageChange(currentPage);
+  }, [currentPage]);
   
   if (cases.length === 0) {
     return React.createElement("div", { className: "text-center py-14 text-[#9A967F]" },
@@ -1989,9 +2309,38 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
     );
   }
   
-  const colCount = 6 + (!compact ? 1 : 0) + (onEdit || onDelete ? 1 : 0);
+  const colCount = 6 + (!compact ? 1 : 0) + (onEdit || onDelete ? 1 : 0) + (selectable ? 1 : 0);
+
+  const goPage = (next) => {
+    setCurrentPage(next);
+  };
   
+  const selectedCount = (selectedIds || []).length;
+
   return React.createElement("div", { className: "flex flex-col gap-3" },
+    selectable && React.createElement("div", {
+      className: "flex items-center justify-between gap-3 flex-wrap px-3 py-2 bg-[#FBF9F3] rounded-lg border border-[#E4E1D6]"
+    },
+      React.createElement("label", {
+        className: "inline-flex items-center gap-2 text-[11px] font-semibold text-[#6B6A5C] cursor-pointer select-none"
+      },
+        React.createElement("input", {
+          type: "checkbox",
+          checked: allPageSelected,
+          ref: el => { if (el) el.indeterminate = somePageSelected && !allPageSelected; },
+          onChange: () => onToggleSelectAll && onToggleSelectAll(pageIds, !allPageSelected),
+          className: "w-3.5 h-3.5 accent-[#16213E] cursor-pointer"
+        }),
+        "ყველას მონიშვნა"
+      ),
+      selectedCount > 0 && typeof onBulkDelete === "function" && React.createElement("button", {
+        onClick: onBulkDelete,
+        className: "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold bg-[#C0392B] text-white hover:bg-[#a5312a]"
+      },
+        React.createElement(Icon, { name: "delete", size: 15 }),
+        ` წაშლა (${selectedCount})`
+      )
+    ),
     cases.length > ITEMS_PER_PAGE && React.createElement("div", {
       className: "flex items-center justify-between px-3 py-2 bg-[#FBF9F3] rounded-lg border border-[#E4E1D6]"
     },
@@ -2001,7 +2350,7 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
       React.createElement("div", { className: "flex gap-1" },
         React.createElement("button", {
           disabled: currentPage === 0,
-          onClick: () => setCurrentPage(p => p - 1),
+          onClick: () => goPage(currentPage - 1),
           className: "px-3 py-1 text-xs font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40 disabled:cursor-not-allowed"
         }, "← წინა"),
         React.createElement("span", { className: "px-3 py-1 text-xs font-semibold text-[#16213E]" },
@@ -2009,7 +2358,7 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
         ),
         React.createElement("button", {
           disabled: currentPage >= totalPages - 1,
-          onClick: () => setCurrentPage(p => p + 1),
+          onClick: () => goPage(currentPage + 1),
           className: "px-3 py-1 text-xs font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40 disabled:cursor-not-allowed"
         }, "შემდეგი →")
       )
@@ -2021,6 +2370,7 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
           React.createElement("tr", {
             className: "text-left text-[10px] uppercase tracking-wider text-[#8A8672] border-b border-[#E4E1D6]"
           },
+            selectable && React.createElement("th", { className: "py-2 pr-2 font-semibold w-8" }, ""),
             React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "№"),
             React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "ინც. თარიღი"),
             React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "Jira №"),
@@ -2034,11 +2384,23 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
         React.createElement("tbody", null,
           paginatedCases.map(c => {
             const isOpen = expanded === c.id;
+            const isChecked = selectedSet.has(c.id);
             return React.createElement(Fragment, { key: c.id },
               React.createElement("tr", {
                 onClick: () => setExpanded(isOpen ? null : c.id),
-                className: `border-b border-[#EEEBDF] hover:bg-[#FBF9F3] transition-colors group cursor-pointer ${isOpen ? "bg-[#FBF9F3]" : ""}`
+                className: `border-b border-[#EEEBDF] hover:bg-[#FBF9F3] transition-colors group cursor-pointer ${isOpen ? "bg-[#FBF9F3]" : ""} ${isChecked ? "bg-[#F3F1E7]" : ""}`
               },
+                selectable && React.createElement("td", {
+                  className: "py-2.5 pr-2",
+                  onClick: e => e.stopPropagation()
+                },
+                  React.createElement("input", {
+                    type: "checkbox",
+                    checked: isChecked,
+                    onChange: () => onToggleSelect(c.id),
+                    className: "w-3.5 h-3.5 accent-[#16213E] cursor-pointer"
+                  })
+                ),
                 React.createElement("td", { className: "py-2.5 pr-3 qa-mono text-[#9A967F]" },
                   React.createElement("span", { className: "inline-flex items-center gap-1" },
                     React.createElement(Icon, {
@@ -2071,7 +2433,7 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
                   title: c.problem
                 }, c.problem || "—"),
                 React.createElement("td", { className: "py-2.5 pr-3" },
-                  React.createElement(AuditResultBadge, { value: c.auditResult, size: "sm" })
+                  React.createElement(AuditResultBadge, { value: c.auditResult, valueId: c.auditResultId, size: "sm" })
                 ),
                 (onEdit || onDelete) && React.createElement("td", { className: "py-2.5 pr-1" },
                   React.createElement("div", {
@@ -2118,11 +2480,11 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
                         React.createElement(CaseDetailRow, { label: "სხვა მიზეზი", value: c.otherReason }),
                         React.createElement("div", { className: "flex flex-col gap-1" },
                           React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "სტატუსი"),
-                          React.createElement(StatusBadge, { status: c.status, size: "sm" })
+                          React.createElement(StatusBadge, { status: c.status, statusId: c.statusId, size: "sm" })
                         ),
                         React.createElement("div", { className: "flex flex-col gap-1" },
                           React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "აუდიტის შედეგი"),
-                          React.createElement(AuditResultBadge, { value: c.auditResult, size: "sm" })
+                          React.createElement(AuditResultBadge, { value: c.auditResult, valueId: c.auditResultId, size: "sm" })
                         ),
                         React.createElement("div", { className: "col-span-2 md:col-span-3" },
                           React.createElement(CaseDetailRow, { label: "გამოვლენილი პრობლემა", value: c.problem })
@@ -2146,7 +2508,7 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
     },
       React.createElement("button", {
         disabled: currentPage === 0,
-        onClick: () => setCurrentPage(p => p - 1),
+        onClick: () => goPage(currentPage - 1),
         className: "px-4 py-2 text-sm font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40"
       }, "← წინა"),
       React.createElement("span", { className: "px-4 py-2 text-sm font-semibold text-[#16213E]" },
@@ -2154,7 +2516,7 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
       ),
       React.createElement("button", {
         disabled: currentPage >= totalPages - 1,
-        onClick: () => setCurrentPage(p => p + 1),
+        onClick: () => goPage(currentPage + 1),
         className: "px-4 py-2 text-sm font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40"
       }, "შემდეგი →")
     )
@@ -2165,37 +2527,72 @@ function CasesTable({ cases, onEdit, onDelete, compact }) {
 /* ================================================================== */
 
 function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
-  const [form, setForm] = useState(initial || {
-    auditDate: new Date().toISOString().slice(0, 10),
-    incidentDate: new Date().toISOString().slice(0, 10),
-    jira: "",
-    operator: employees[0]?.name || "",
-    department: lists.departments[0] || "",
-    category: lists.categories[0] || "",
-    helpType: lists.helpTypes[0] || "",
-    delayReason: "",
-    otherReason: "",
-    problem: "",
-    recommendation: "",
-    status: lists.statuses[0] || "",
-    auditResult: lists.auditResults[0] || ""
+  const [form, setForm] = useState(() => {
+    if (initial) {
+      return {
+        ...initial,
+        statusId: initial.statusId || "",
+        categoryId: initial.categoryId || "",
+        departmentId: initial.departmentId || "",
+        helpTypeId: initial.helpTypeId || "",
+        delayReasonId: initial.delayReasonId || "",
+        auditResultId: initial.auditResultId || "",
+        operatorId: initial.operatorId || ""
+      };
+    }
+    return {
+      auditDate: new Date().toISOString().slice(0, 10),
+      incidentDate: new Date().toISOString().slice(0, 10),
+      jira: "",
+      operatorId: "",
+      departmentId: getDefaultId(lists.departments),
+      categoryId: getDefaultId(lists.categories),
+      helpTypeId: getDefaultId(lists.helpTypes),
+      delayReasonId: getDefaultId(lists.delayReasons),
+      otherReason: "",
+      problem: "",
+      recommendation: "",
+      statusId: getDefaultId(lists.statuses),
+      auditResultId: getDefaultId(lists.auditResults)
+    };
   });
-  
+
   const set = k => e => setForm({ ...form, [k]: e.target.value });
-  const valid = form.incidentDate && form.category && form.status && form.auditResult;
-  
+  const valid = form.incidentDate && form.categoryId && form.statusId && form.auditResultId;
+
+  const buildPayload = () => {
+    const operator = (employees.find(e => e.id === form.operatorId) || {}).name || "";
+    return {
+      ...form,
+      operatorId: form.operatorId || "",
+      departmentId: form.departmentId || "",
+      categoryId: form.categoryId || "",
+      helpTypeId: form.helpTypeId || "",
+      delayReasonId: form.delayReasonId || "",
+      statusId: form.statusId || "",
+      auditResultId: form.auditResultId || "",
+      operator,
+      department: labelOf(lists.departments, form.departmentId),
+      category: labelOf(lists.categories, form.categoryId),
+      helpType: labelOf(lists.helpTypes, form.helpTypeId),
+      delayReason: labelOf(lists.delayReasons, form.delayReasonId),
+      status: labelOf(lists.statuses, form.statusId),
+      auditResult: labelOf(lists.auditResults, form.auditResultId)
+    };
+  };
+
   return React.createElement(Modal, {
     title: initial ? "საქმის რედაქტირება" : "ახალი საქმის დამატება",
     onClose: onClose,
-    closeOnBackdrop: false,
-    size: "xl"
+    size: "xl",
+    closeOnBackdrop: false
   },
     React.createElement("div", { className: "grid grid-cols-2 gap-6" },
       React.createElement(Field, { label: "აუდიტის თარიღი" },
         React.createElement("input", {
           type: "date",
           className: inputCls,
-          value: form.auditDate,
+          value: form.auditDate || "",
           onChange: set("auditDate")
         })
       ),
@@ -2203,7 +2600,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
         React.createElement("input", {
           type: "date",
           className: inputCls,
-          value: form.incidentDate,
+          value: form.incidentDate || "",
           onChange: set("incidentDate")
         })
       ),
@@ -2211,80 +2608,85 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
         React.createElement("input", {
           className: inputCls,
           placeholder: "JIRA-0000",
-          value: form.jira,
+          value: form.jira || "",
           onChange: set("jira")
         })
       ),
       React.createElement(Field, { label: "ოპერატორის სახელი, გვარი" },
         React.createElement("select", {
           className: inputCls,
-          value: form.operator,
-          onChange: set("operator")
+          value: form.operatorId || "",
+          onChange: set("operatorId")
         },
-          React.createElement("option", { value: "" }, "—"),
-          employees.map(e => React.createElement("option", { key: e.id, value: e.name }, e.name))
+          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
+          employees.map(e => React.createElement("option", { key: e.id, value: e.id }, e.name))
         )
       ),
       React.createElement(Field, { label: "დეპარტამენტი" },
         React.createElement("select", {
           className: inputCls,
-          value: form.department,
-          onChange: set("department")
+          value: form.departmentId || "",
+          onChange: set("departmentId")
         },
-          lists.departments.map(d => React.createElement("option", { key: d }, d))
+          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
+          lists.departments.map(d => React.createElement("option", { key: d.id, value: d.id }, d.label))
         )
       ),
       React.createElement(Field, { label: "მოთხოვნის კატეგორია *" },
         React.createElement("select", {
           className: inputCls,
-          value: form.category,
-          onChange: set("category")
+          value: form.categoryId || "",
+          onChange: set("categoryId")
         },
-          lists.categories.map(c => React.createElement("option", { key: c }, c))
+          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
+          lists.categories.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
         )
       ),
       React.createElement(Field, { label: "დახმარების ტიპი" },
         React.createElement("select", {
           className: inputCls,
-          value: form.helpType,
-          onChange: set("helpType")
+          value: form.helpTypeId || "",
+          onChange: set("helpTypeId")
         },
-          lists.helpTypes.map(c => React.createElement("option", { key: c }, c))
+          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
+          lists.helpTypes.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
         )
       ),
       React.createElement(Field, { label: "შეფერხების მიზეზი" },
         React.createElement("select", {
           className: inputCls,
-          value: form.delayReason,
-          onChange: set("delayReason")
+          value: form.delayReasonId || "",
+          onChange: set("delayReasonId")
         },
-          React.createElement("option", { value: "" }, "—"),
-          lists.delayReasons.map(c => React.createElement("option", { key: c, value: c }, c))
+          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
+          lists.delayReasons.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
         )
       ),
       React.createElement(Field, { label: "სხვა მიზეზი" },
         React.createElement("input", {
           className: inputCls,
-          value: form.otherReason,
+          value: form.otherReason || "",
           onChange: set("otherReason")
         })
       ),
       React.createElement(Field, { label: "სტატუსი *" },
         React.createElement("select", {
           className: inputCls,
-          value: form.status,
-          onChange: set("status")
+          value: form.statusId || "",
+          onChange: set("statusId")
         },
-          lists.statuses.map(c => React.createElement("option", { key: c }, c))
+          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
+          lists.statuses.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
         )
       ),
       React.createElement(Field, { label: "აუდიტის შედეგი *" },
         React.createElement("select", {
           className: inputCls,
-          value: form.auditResult,
-          onChange: set("auditResult")
+          value: form.auditResultId || "",
+          onChange: set("auditResultId")
         },
-          lists.auditResults.map(r => React.createElement("option", { key: r }, r))
+          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
+          lists.auditResults.map(r => React.createElement("option", { key: r.id, value: r.id }, r.label))
         )
       ),
       React.createElement("div", { className: "col-span-2" },
@@ -2292,7 +2694,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
           React.createElement("textarea", {
             rows: 6,
             className: inputCls,
-            value: form.problem,
+            value: form.problem || "",
             onChange: set("problem")
           })
         )
@@ -2302,7 +2704,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
           React.createElement("textarea", {
             rows: 6,
             className: inputCls,
-            value: form.recommendation,
+            value: form.recommendation || "",
             onChange: set("recommendation")
           })
         )
@@ -2315,7 +2717,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
       }, "გაუქმება"),
       React.createElement("button", {
         disabled: !valid,
-        onClick: () => valid && onSave(form),
+        onClick: () => valid && onSave(buildPayload()),
         className: "px-4 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057] disabled:opacity-40 flex items-center gap-1.5"
       },
         React.createElement(Icon, { name: "check", size: 15 }),
@@ -2393,7 +2795,7 @@ function DashboardPage({ cases }) {
   const filtered = useMemo(() => applyFilters(cases, filters), [cases, filters]);
   
   const total = filtered.length;
-  const closed = filtered.filter(c => c.status === "დახურულია").length;
+  const closed = filtered.filter(c => isStatusClosed(c)).length;
   const open = total - closed;
   
   const statusRows = tally(filtered, "status");
@@ -2446,6 +2848,8 @@ function CasesPage({ data, saveData }) {
   const [editing, setEditing] = useState(null);
   const [adding, setAdding] = useState(false);
   const [toDelete, setToDelete] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [bulkDeletePending, setBulkDeletePending] = useState(false);
   
   const years = useMemo(() => {
     const s = new Set(data.cases.map(c => yearOf(c.incidentDate)).filter(Boolean));
@@ -2471,20 +2875,24 @@ function CasesPage({ data, saveData }) {
       ].filter(Boolean).join(' ').toLowerCase()
     }));
   }, [data.cases]);
+
+  useEffect(() => {
+    setSelectedIds([]);
+  }, [query, statusFilter, categoryFilter, resultFilter, timeFilters.date, timeFilters.week, timeFilters.month, timeFilters.quarter, timeFilters.year]);
   
   const filtered = useMemo(() => {
     let result = applyFilters(data.cases, timeFilters);
     
     if (statusFilter) {
-      result = result.filter(c => c.status === statusFilter);
+      result = result.filter(c => c.statusId === statusFilter || c.status === statusFilter);
     }
 
     if (categoryFilter) {
-      result = result.filter(c => c.category === categoryFilter);
+      result = result.filter(c => c.categoryId === categoryFilter || c.category === categoryFilter);
     }
 
     if (resultFilter) {
-      result = result.filter(c => c.auditResult === resultFilter);
+      result = result.filter(c => c.auditResultId === resultFilter || c.auditResult === resultFilter);
     }
 
     if (query) {
@@ -2522,12 +2930,33 @@ function CasesPage({ data, saveData }) {
   const deleteCase = () => {
     saveData({ ...data, cases: data.cases.filter(c => c.id !== toDelete.id) });
     setToDelete(null);
+    setSelectedIds(ids => ids.filter(id => id !== toDelete.id));
+  };
+
+  const toggleSelect = (id) => {
+    setSelectedIds(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]);
+  };
+
+  const toggleSelectAll = (pageIds, select) => {
+    if (select) {
+      setSelectedIds(prev => [...new Set([...prev, ...pageIds])]);
+    } else {
+      const pageSet = new Set(pageIds);
+      setSelectedIds(prev => prev.filter(id => !pageSet.has(id)));
+    }
+  };
+
+  const confirmBulkDelete = () => {
+    const idSet = new Set(selectedIds);
+    saveData({ ...data, cases: data.cases.filter(c => !idSet.has(c.id)) });
+    setSelectedIds([]);
+    setBulkDeletePending(false);
   };
   
   const exportExcel = async (filteredCases) => {
     const all = [...filteredCases].sort((a, b) => (a.no || 0) - (b.no || 0));
     const total = all.length;
-    const closed = all.filter(c => c.status === "დახურულია").length;
+    const closed = all.filter(c => isStatusClosed(c)).length;
     const open = total - closed;
     const auditRows = tally(all, "auditResult");
     const catRows = tally(all, "category");
@@ -2868,7 +3297,7 @@ function CasesPage({ data, saveData }) {
           "ყველა ჩანაწერი ინახება ავტომატურად და დაშიფრულად."
         )
       ),
-      React.createElement("div", { className: "flex gap-2" },
+      React.createElement("div", { className: "flex gap-2 flex-wrap" },
         React.createElement("button", {
           onClick: () => exportExcel(filtered),
           className: "flex items-center gap-1.5 px-3.5 py-2 rounded-md text-sm font-semibold border border-[#DBD7C8] bg-white hover:bg-[#F3F1E7] text-[#3A3A32]",
@@ -2909,7 +3338,7 @@ function CasesPage({ data, saveData }) {
         onChange: e => setStatusFilter(e.target.value)
       },
         React.createElement("option", { value: "" }, "ყველა სტატუსი"),
-        data.statuses.map(s => React.createElement("option", { key: s }, s))
+        data.statuses.map(s => React.createElement("option", { key: s.id, value: s.id }, s.label))
       ),
       React.createElement("select", {
         className: selectCls,
@@ -2917,7 +3346,7 @@ function CasesPage({ data, saveData }) {
         onChange: e => setCategoryFilter(e.target.value)
       },
         React.createElement("option", { value: "" }, "ყველა კატეგორია"),
-        data.categories.map(c => React.createElement("option", { key: c }, c))
+        data.categories.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
       ),
       React.createElement("select", {
         className: selectCls,
@@ -2925,7 +3354,7 @@ function CasesPage({ data, saveData }) {
         onChange: e => setResultFilter(e.target.value)
       },
         React.createElement("option", { value: "" }, "ყველა შედეგი"),
-        data.auditResults.map(r => React.createElement("option", { key: r }, r))
+        data.auditResults.map(r => React.createElement("option", { key: r.id, value: r.id }, r.label))
       )
     ),
     React.createElement(FilterBar, { filters: timeFilters, setFilters: setTimeFilters, years }),
@@ -2936,7 +3365,12 @@ function CasesPage({ data, saveData }) {
       React.createElement(CasesTable, {
         cases: filtered,
         onEdit: setEditing,
-        onDelete: setToDelete
+        onDelete: setToDelete,
+        selectedIds,
+        onToggleSelect: toggleSelect,
+        onToggleSelectAll: toggleSelectAll,
+        onPageChange: () => setSelectedIds([]),
+        onBulkDelete: () => setBulkDeletePending(true)
       })
     ),
     (adding || editing) && React.createElement(CaseFormModal, {
@@ -2950,9 +3384,14 @@ function CasesPage({ data, saveData }) {
       }
     }),
     toDelete && React.createElement(ConfirmDialog, {
-      text: `ნამდვილად გსურთ საქმის №${String(toDelete.no).padStart(3, "0")} წაშლა? მოქმედება შეუქცევადია.`,
+      text: `ნამდვილად გსურთ საქმის №${String(toDelete.no).padStart(3, "0")} წაშლა?`,
       onConfirm: deleteCase,
       onCancel: () => setToDelete(null)
+    }),
+    bulkDeletePending && React.createElement(ConfirmDialog, {
+      text: `ნამდვილად გსურთ ${selectedIds.length} მონიშნული ჩანაწერის წაშლა?`,
+      onConfirm: confirmBulkDelete,
+      onCancel: () => setBulkDeletePending(false)
     })
   );
 }
@@ -2962,50 +3401,68 @@ function CasesPage({ data, saveData }) {
 /* ================================================================== */
 
 function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose }) {
-  const [form, setForm] = useState(initial || {
-    jira: "",
-    employee: "",
-    incidentType: incidentTypes[0] || "",
-    protocolCompliant: false,
-    incomingRequest: "",
-    response: ""
+  const [form, setForm] = useState(() => {
+    if (initial) {
+      return {
+        ...initial,
+        incidentTypeId: initial.incidentTypeId || "",
+        employeeId: initial.employeeId || ""
+      };
+    }
+    return {
+      jira: "",
+      employeeId: "",
+      incidentTypeId: getDefaultId(incidentTypes),
+      protocolCompliant: false,
+      incomingRequest: "",
+      response: ""
+    };
   });
 
   const set = k => e => setForm({ ...form, [k]: e.target.value });
 
+  const buildPayload = () => ({
+    ...form,
+    incidentTypeId: form.incidentTypeId || "",
+    employeeId: form.employeeId || "",
+    incidentType: labelOf(incidentTypes, form.incidentTypeId),
+    employee: (employees.find(e => e.id === form.employeeId) || {}).name || ""
+  });
+
   return React.createElement(Modal, {
     title: initial ? "შემთხვევის რედაქტირება" : "ახალი შემთხვევის დამატება",
     onClose: onClose,
-    closeOnBackdrop: false,
-    size: "xl"
+    size: "xl",
+    closeOnBackdrop: false
   },
     React.createElement("div", { className: "grid grid-cols-2 gap-6" },
       React.createElement(Field, { label: "Jira №" },
         React.createElement("input", {
           className: inputCls,
           placeholder: "JIRA-0000",
-          value: form.jira,
+          value: form.jira || "",
           onChange: set("jira")
         })
       ),
       React.createElement(Field, { label: "თანამშრომელი", hint: "არასავალდებულო" },
         React.createElement("select", {
           className: inputCls,
-          value: form.employee,
-          onChange: set("employee")
+          value: form.employeeId || "",
+          onChange: set("employeeId")
         },
           React.createElement("option", { value: "" }, "— აირჩიე —"),
-          employees.map(e => React.createElement("option", { key: e.id, value: e.name }, e.name))
+          employees.map(e => React.createElement("option", { key: e.id, value: e.id }, e.name))
         )
       ),
       React.createElement("div", { className: "col-span-2" },
         React.createElement(Field, { label: "შემთხვევა *" },
           React.createElement("select", {
             className: inputCls,
-            value: form.incidentType,
-            onChange: set("incidentType")
+            value: form.incidentTypeId || "",
+            onChange: set("incidentTypeId")
           },
-            incidentTypes.map(t => React.createElement("option", { key: t }, t))
+            React.createElement("option", { value: "" }, "—"),
+            incidentTypes.map(t => React.createElement("option", { key: t.id, value: t.id }, t.label))
           )
         )
       ),
@@ -3054,7 +3511,7 @@ function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose 
         className: "px-4 py-2 rounded-md text-sm font-semibold text-[#6B6A5C] hover:bg-[#EFEDE2]"
       }, "გაუქმება"),
       React.createElement("button", {
-        onClick: () => onSave(form),
+        onClick: () => onSave(buildPayload()),
         className: "px-4 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057] flex items-center gap-1.5"
       },
         React.createElement(Icon, { name: "check", size: 15 }),
@@ -3068,10 +3525,12 @@ function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose 
 /*  INCIDENTS TABLE (expandable rows)                              */
 /* ================================================================== */
 
-function IncidentsTable({ incidents, onEdit, onDelete, onPrint }) {
+function IncidentsTable({ incidents, onEdit, onDelete, onPrint, selectedIds, onToggleSelect, onToggleSelectAll, onPageChange, onBulkDelete }) {
   const [expanded, setExpanded] = useState(null);
   const [currentPage, setCurrentPage] = useState(0);
   const ITEMS_PER_PAGE = 100;
+  const selectable = typeof onToggleSelect === "function";
+  const selectedSet = useMemo(() => new Set(selectedIds || []), [selectedIds]);
 
   const totalPages = Math.ceil(incidents.length / ITEMS_PER_PAGE);
   const paginatedIncidents = useMemo(() => {
@@ -3079,9 +3538,17 @@ function IncidentsTable({ incidents, onEdit, onDelete, onPrint }) {
     return incidents.slice(start, start + ITEMS_PER_PAGE);
   }, [incidents, currentPage]);
 
+  const pageIds = useMemo(() => paginatedIncidents.map(i => i.id), [paginatedIncidents]);
+  const allPageSelected = pageIds.length > 0 && pageIds.every(id => selectedSet.has(id));
+  const somePageSelected = pageIds.some(id => selectedSet.has(id));
+
   useEffect(() => {
     setCurrentPage(0);
   }, [incidents.length]);
+
+  useEffect(() => {
+    if (typeof onPageChange === "function") onPageChange(currentPage);
+  }, [currentPage]);
 
   if (incidents.length === 0) {
     return React.createElement("div", { className: "text-center py-14 text-[#9A967F]" },
@@ -3089,6 +3556,8 @@ function IncidentsTable({ incidents, onEdit, onDelete, onPrint }) {
       React.createElement("p", { className: "text-sm italic" }, "შემთხვევები არ მოიძებნა")
     );
   }
+
+  const goPage = (next) => setCurrentPage(next);
 
   const Pager = () => React.createElement("div", {
     className: "flex items-center justify-between px-3 py-2 bg-[#FBF9F3] rounded-lg border border-[#E4E1D6]"
@@ -3099,7 +3568,7 @@ function IncidentsTable({ incidents, onEdit, onDelete, onPrint }) {
     React.createElement("div", { className: "flex gap-1" },
       React.createElement("button", {
         disabled: currentPage === 0,
-        onClick: () => setCurrentPage(p => p - 1),
+        onClick: () => goPage(currentPage - 1),
         className: "px-3 py-1 text-xs font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40 disabled:cursor-not-allowed"
       }, "← წინა"),
       React.createElement("span", { className: "px-3 py-1 text-xs font-semibold text-[#16213E]" },
@@ -3107,25 +3576,58 @@ function IncidentsTable({ incidents, onEdit, onDelete, onPrint }) {
       ),
       React.createElement("button", {
         disabled: currentPage >= totalPages - 1,
-        onClick: () => setCurrentPage(p => p + 1),
+        onClick: () => goPage(currentPage + 1),
         className: "px-3 py-1 text-xs font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40 disabled:cursor-not-allowed"
       }, "შემდეგი →")
     )
   );
 
+  const selectedCount = (selectedIds || []).length;
+
   return React.createElement("div", { className: "flex flex-col gap-3" },
+    selectable && React.createElement("div", {
+      className: "flex items-center justify-between gap-3 flex-wrap px-3 py-2 bg-[#FBF9F3] rounded-lg border border-[#E4E1D6]"
+    },
+      React.createElement("label", {
+        className: "inline-flex items-center gap-2 text-[11px] font-semibold text-[#6B6A5C] cursor-pointer select-none"
+      },
+        React.createElement("input", {
+          type: "checkbox",
+          checked: allPageSelected,
+          ref: el => { if (el) el.indeterminate = somePageSelected && !allPageSelected; },
+          onChange: () => onToggleSelectAll && onToggleSelectAll(pageIds, !allPageSelected),
+          className: "w-3.5 h-3.5 accent-[#16213E] cursor-pointer"
+        }),
+        "ყველას მონიშვნა"
+      ),
+      selectedCount > 0 && typeof onBulkDelete === "function" && React.createElement("button", {
+        onClick: onBulkDelete,
+        className: "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold bg-[#C0392B] text-white hover:bg-[#a5312a]"
+      },
+        React.createElement(Icon, { name: "delete", size: 15 }),
+        ` წაშლა (${selectedCount})`
+      )
+    ),
     incidents.length > ITEMS_PER_PAGE && React.createElement(Pager, null),
     React.createElement("div", { className: "flex flex-col gap-2" },
     paginatedIncidents.map(inc => {
       const isOpen = expanded === inc.id;
+      const isChecked = selectedSet.has(inc.id);
       return React.createElement("div", {
         key: inc.id,
-        className: `qa-fade-up rounded-lg border ${isOpen ? "border-[#EADFB8] bg-[#FBF9F3]" : "border-[#E4E1D6] bg-white"} overflow-hidden`
+        className: `qa-fade-up rounded-lg border ${isOpen ? "border-[#EADFB8] bg-[#FBF9F3]" : "border-[#E4E1D6] bg-white"} overflow-hidden ${isChecked ? "ring-1 ring-[#B8860B]/40" : ""}`
       },
         React.createElement("div", {
           onClick: () => setExpanded(isOpen ? null : inc.id),
           className: "flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-[#FBF9F3] transition-colors group"
         },
+          selectable && React.createElement("input", {
+            type: "checkbox",
+            checked: isChecked,
+            onChange: () => onToggleSelect(inc.id),
+            onClick: e => e.stopPropagation(),
+            className: "w-3.5 h-3.5 accent-[#16213E] cursor-pointer shrink-0"
+          }),
           React.createElement(Icon, {
             name: "chevron_right",
             size: 15,
@@ -3316,8 +3818,14 @@ function IncidentsPage({ data, saveData }) {
   const [adding, setAdding] = useState(false);
   const [toDelete, setToDelete] = useState(null);
   const [printId, setPrintId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [bulkDeletePending, setBulkDeletePending] = useState(false);
 
   const incidents = data.incidents || [];
+
+  useEffect(() => {
+    setSelectedIds([]);
+  }, [query, typeFilter, employeeFilter, starFilter]);
 
   useEffect(() => {
     if (printId) {
@@ -3341,7 +3849,7 @@ function IncidentsPage({ data, saveData }) {
 
   const filtered = useMemo(() => {
     let result = incidents;
-    if (typeFilter) result = result.filter(i => i.incidentType === typeFilter);
+    if (typeFilter) result = result.filter(i => i.incidentTypeId === typeFilter || i.incidentType === typeFilter);
     if (employeeFilter) {
       if (employeeFilter === "__none__") {
         result = result.filter(i => !i.employee);
@@ -3393,6 +3901,27 @@ function IncidentsPage({ data, saveData }) {
   const deleteIncident = () => {
     saveData({ ...data, incidents: incidents.filter(i => i.id !== toDelete.id) });
     setToDelete(null);
+    setSelectedIds(ids => ids.filter(id => id !== toDelete.id));
+  };
+
+  const toggleSelect = (id) => {
+    setSelectedIds(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]);
+  };
+
+  const toggleSelectAll = (pageIds, select) => {
+    if (select) {
+      setSelectedIds(prev => [...new Set([...prev, ...pageIds])]);
+    } else {
+      const pageSet = new Set(pageIds);
+      setSelectedIds(prev => prev.filter(id => !pageSet.has(id)));
+    }
+  };
+
+  const confirmBulkDelete = () => {
+    const idSet = new Set(selectedIds);
+    saveData({ ...data, incidents: incidents.filter(i => !idSet.has(i.id)) });
+    setSelectedIds([]);
+    setBulkDeletePending(false);
   };
 
   const generatedAt = `${formatDocDate()} ${formatDocTime()}`;
@@ -3618,7 +4147,7 @@ function IncidentsPage({ data, saveData }) {
             "შემოსული მოთხოვნები, დაბრუნებული პასუხები და პროტოკოლის შესაბამისობა."
           )
         ),
-        React.createElement("div", { className: "flex gap-2" },
+        React.createElement("div", { className: "flex gap-2 flex-wrap" },
           React.createElement("button", {
             onClick: () => exportIncidentsExcel(filtered),
             className: "flex items-center gap-1.5 px-3.5 py-2 rounded-md text-sm font-semibold border border-[#DBD7C8] bg-white hover:bg-[#F3F1E7] text-[#3A3A32]",
@@ -3660,7 +4189,7 @@ function IncidentsPage({ data, saveData }) {
           onChange: e => setTypeFilter(e.target.value)
         },
           React.createElement("option", { value: "" }, "ყველა შემთხვევა"),
-          data.incidentTypes.map(t => React.createElement("option", { key: t }, t))
+          data.incidentTypes.map(t => React.createElement("option", { key: t.id, value: t.id }, t.label))
         ),
         React.createElement("select", {
           className: selectCls,
@@ -3703,7 +4232,12 @@ function IncidentsPage({ data, saveData }) {
           incidents: filtered,
           onEdit: setEditing,
           onDelete: setToDelete,
-          onPrint: inc => setPrintId(inc.id)
+          onPrint: inc => setPrintId(inc.id),
+          selectedIds,
+          onToggleSelect: toggleSelect,
+          onToggleSelectAll: toggleSelectAll,
+          onPageChange: () => setSelectedIds([]),
+          onBulkDelete: () => setBulkDeletePending(true)
         })
       ),
 
@@ -3719,9 +4253,15 @@ function IncidentsPage({ data, saveData }) {
       }),
 
       toDelete && React.createElement(ConfirmDialog, {
-        text: `ნამდვილად გსურთ შემთხვევა №${String(toDelete.no).padStart(3, "0")} (${toDelete.jira || "Jira არ არის"}) წაშლა? მოქმედება შეუქცევადია.`,
+        text: `ნამდვილად გსურთ შემთხვევა №${String(toDelete.no).padStart(3, "0")}  წაშლა?`,
         onConfirm: deleteIncident,
         onCancel: () => setToDelete(null)
+      }),
+
+      bulkDeletePending && React.createElement(ConfirmDialog, {
+        text: `ნამდვილად გსურთ ${selectedIds.length} მონიშნული ჩანაწერის წაშლა?`,
+        onConfirm: confirmBulkDelete,
+        onCancel: () => setBulkDeletePending(false)
       })
     ),
 
@@ -3739,8 +4279,8 @@ function EmployeesPage({ data, saveData, goToEmployee }) {
   const [toDelete, setToDelete] = useState(null);
   
   const stats = name => {
-    const list = data.cases.filter(c => c.operator === name);
-    const closed = list.filter(c => c.status === "დახურულია").length;
+    const list = data.cases.filter(c => c.operator === name || c.operatorId === (data.employees.find(e => e.name === name) || {}).id);
+    const closed = list.filter(c => isStatusClosed(c)).length;
     return { total: list.length, closed, open: list.length - closed };
   };
   
@@ -3749,9 +4289,9 @@ function EmployeesPage({ data, saveData, goToEmployee }) {
     if (editing) {
       employees = data.employees.map(e => e.id === editing.id ? { ...editing, ...form } : e);
     } else {
-      employees = [...data.employees, { id: uid(), ...form }];
+      employees = [...data.employees, { id: newRefId("emp"), ...form }];
     }
-    saveData({ ...data, employees });
+    saveData(resyncLabels({ ...data, employees }));
     setEditing(null);
     setAdding(false);
   };
@@ -3909,7 +4449,6 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
     if (s.size === 0) {
       s.add(new Date().getFullYear());
     }
-    // ეს ჩანაწერი გაკეთდა დინამიურად წლის გამოთვლისთვის
     return Array.from(s).sort((a, b) => b - a);
   }, [data.cases]);
   
@@ -3917,7 +4456,7 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
   const filtered = useMemo(() => applyFilters(employeeCases, filters), [employeeCases, filters]);
   
   const total = filtered.length;
-  const closed = filtered.filter(c => c.status === "დახურულია").length;
+  const closed = filtered.filter(c => isStatusClosed(c)).length;
   const open = total - closed;
   
   const generatedAt = `${formatDocDate()} ${formatDocTime()}`;
@@ -4026,7 +4565,7 @@ function CategoryDetailPage({ data, selected, setSelected }) {
   const filtered = useMemo(() => applyFilters(categoryCases, filters), [categoryCases, filters]);
   
   const total = filtered.length;
-  const closed = filtered.filter(c => c.status === "დახურულია").length;
+  const closed = filtered.filter(c => isStatusClosed(c)).length;
   const open = total - closed;
   
   const generatedAt = `${formatDocDate()} ${formatDocTime()}`;
@@ -4057,7 +4596,7 @@ function CategoryDetailPage({ data, selected, setSelected }) {
             onChange: e => setSelected(e.target.value)
           },
             React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-            data.categories.map(c => React.createElement("option", { key: c, value: c }, c))
+            data.categories.map(c => React.createElement("option", { key: c.id, value: c.label }, c.label))
           )
         )
       ),
@@ -4114,9 +4653,26 @@ function CategoryDetailPage({ data, selected, setSelected }) {
 /*  SETTINGS PAGE                                                 */
 /* ================================================================== */
 
-function ListEditor({ title, items, onAdd, onRemove, hint }) {
+function ListEditor({ title, items, onAdd, onRemove, onRename, onSetDefault, hint, usageCount }) {
   const [value, setValue] = useState("");
-  
+  const [editingId, setEditingId] = useState(null);
+  const [editLabel, setEditLabel] = useState("");
+
+  const startEdit = (it) => {
+    setEditingId(it.id);
+    setEditLabel(it.label);
+  };
+
+  const commitEdit = () => {
+    const next = editLabel.trim();
+    if (!next || !editingId) {
+      setEditingId(null);
+      return;
+    }
+    if (typeof onRename === "function") onRename(editingId, next);
+    setEditingId(null);
+  };
+
   return React.createElement("div", { className: "bg-white rounded-lg border border-[#E4E1D6] p-5" },
     React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E] mb-1" }, title),
     hint && React.createElement("p", { className: "text-xs text-[#9A967F] mb-3" }, hint),
@@ -4144,17 +4700,62 @@ function ListEditor({ title, items, onAdd, onRemove, hint }) {
       }, React.createElement(Icon, { name: "add", size: 15 }))
     ),
     React.createElement("div", { className: "flex flex-col gap-1.5 max-h-52 overflow-y-auto qa-scroll pr-1" },
-      items.map(it => React.createElement("div", {
-        key: it,
-        className: "flex items-center justify-between px-3 py-1.5 rounded-md bg-[#FBF9F3] border border-[#EEEBDF] text-sm"
-      },
-        React.createElement("span", { className: "text-[#3A3A32]" }, it),
-        React.createElement("button", {
-          onClick: () => onRemove(it),
-          className: "text-[#C0392B] hover:text-[#a5312a]"
-        }, React.createElement(Icon, { name: "close", size: 14 }))
-      )),
-      items.length === 0 && React.createElement("p", { className: "text-xs text-[#9A967F] italic" }, "სია ცარიელია")
+      (items || []).map(it => {
+        const used = typeof usageCount === "function" ? usageCount(it.id) : 0;
+        const isEditing = editingId === it.id;
+        const isDef = it.isDefault === true;
+        return React.createElement("div", {
+          key: it.id,
+          className: "flex items-center justify-between gap-2 px-3 py-1.5 rounded-md bg-[#FBF9F3] border border-[#EEEBDF] text-sm"
+        },
+          isEditing
+            ? React.createElement("input", {
+                className: inputCls + " py-1",
+                value: editLabel,
+                autoFocus: true,
+                onChange: e => setEditLabel(e.target.value),
+                onKeyDown: e => {
+                  if (e.key === "Enter") commitEdit();
+                  if (e.key === "Escape") setEditingId(null);
+                },
+                onBlur: commitEdit
+              })
+            : React.createElement("span", { className: "text-[#3A3A32] flex-1 truncate flex items-center gap-1.5" },
+                isDef && React.createElement("span", {
+                  className: "inline-block w-2 h-2 rounded-full shrink-0",
+                  style: { background: "#1F6F50" },
+                  title: "ნაგულისხმევი"
+                }),
+                it.label,
+                used > 0 && React.createElement("span", {
+                  className: "ml-1 text-[10px] text-[#9A967F]"
+                }, `(${used})`)
+              ),
+          React.createElement("div", { className: "flex items-center gap-1 shrink-0" },
+            typeof onSetDefault === "function" && !isEditing && React.createElement("button", {
+              onClick: () => onSetDefault(it.id),
+              className: "p-0.5 rounded-md",
+              style: { color: isDef ? "#1F6F50" : "#9A967F" },
+              title: isDef ? "ნაგულისხმევის გაუქმება" : "ნაგულისხმევად დაყენება"
+            }, React.createElement(Icon, {
+              name: isDef ? "check_circle" : "radio_button_unchecked",
+              size: 16,
+              filled: isDef
+            })),
+            !isEditing && React.createElement("button", {
+              onClick: () => startEdit(it),
+              className: "text-[#2A4270] hover:text-[#16213E] p-0.5",
+              title: "რედაქტირება"
+            }, React.createElement(Icon, { name: "edit", size: 14 })),
+            React.createElement("button", {
+              onClick: () => onRemove(it.id, used),
+              className: "text-[#C0392B] hover:text-[#a5312a] p-0.5",
+              title: used > 0 ? `გამოიყენება ${used} ჩანაწერში` : "წაშლა"
+            }, React.createElement(Icon, { name: "close", size: 14 }))
+          )
+        );
+      }),
+      (!items || items.length === 0) && React.createElement("p", { className: "text-xs text-[#9A967F] italic" }, "სია ცარიელია")
     )
   );
 }
@@ -4446,18 +5047,65 @@ function SettingsPage({
     ),
     
     React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4" },
-      listFields.map(f => React.createElement(ListEditor, {
-        key: f.key,
-        title: f.label,
-        items: data[f.key],
-        onAdd: v => !data[f.key].includes(v) && update(f.key, [...data[f.key], v]),
-        onRemove: v => update(f.key, data[f.key].filter(x => x !== v)),
-        hint: f.key === "auditResults"
-          ? "სამ სტანდარტულ მნიშვნელობას (სრული/ნაწილობრივი/ხარვეზიანი) ფიქსირებული ფერი აქვს."
-          : f.key === "incidentTypes"
-          ? "ეს სია ივსება „შემთხვევები“ გვერდის ჩამოსაშლელ ველში."
-          : null
-      }))
+      listFields.map(f => {
+        const idFieldByList = {
+          categories: "categoryId",
+          departments: "departmentId",
+          helpTypes: "helpTypeId",
+          delayReasons: "delayReasonId",
+          statuses: "statusId",
+          auditResults: "auditResultId",
+          incidentTypes: "incidentTypeId"
+        };
+        const idField = idFieldByList[f.key];
+        const usageCount = (id) => {
+          if (f.key === "incidentTypes") {
+            return (data.incidents || []).filter(i => i.incidentTypeId === id).length;
+          }
+          return (data.cases || []).filter(c => c[idField] === id).length;
+        };
+        return React.createElement(ListEditor, {
+          key: f.key,
+          title: f.label,
+          items: data[f.key],
+          usageCount,
+          onAdd: (label) => {
+            const list = data[f.key] || [];
+            if (list.some(x => x.label === label)) return;
+            const known = f.key === "statuses" ? KNOWN_STATUS_IDS : f.key === "auditResults" ? KNOWN_AUDIT_IDS : null;
+            const id = (known && known[label]) || newRefId(f.key.slice(0, 3));
+            update(f.key, [...list, { id, label, isDefault: false }]);
+          },
+          onRename: (id, newLabel) => {
+            const list = data[f.key] || [];
+            if (list.some(x => x.id !== id && x.label === newLabel)) return;
+            const nextList = list.map(x => x.id === id ? { ...x, label: newLabel } : x);
+            const next = resyncLabels({ ...data, [f.key]: nextList });
+            saveData(next);
+          },
+          onSetDefault: (id) => {
+            const list = data[f.key] || [];
+            update(f.key, setDefaultInList(list, id));
+          },
+          onRemove: (id, used) => {
+            if (used > 0) {
+              setAlertModal({
+                type: "warning",
+                title: "წაშლა შეუძლებელია",
+                message: `ეს მნიშვნელობა გამოიყენება ${used} ჩანაწერში.`,
+                details: "ჯერ შეცვალე ან წაშალე შესაბამისი ჩანაწერები, ან გადაარქვი სახელი."
+              });
+              return;
+            }
+            update(f.key, (data[f.key] || []).filter(x => x.id !== id));
+          },
+          hint: f.key === "auditResults"
+            ? "მწვანე ნიშანი = ნაგულისხმევი ახალ საქმეზე. სახელის შეცვლა არ არღვევს სტატისტიკას."
+            : f.key === "incidentTypes"
+            ? "მწვანე ნიშანი = ნაგულისხმევი ახალ შემთხვევაზე."
+            : "მწვანე ნიშანი = ნაგულისხმევი. კვლავ დაჭერით გასაუქმებლად. მხოლოდ ერთი შეიძლება იყოს მონიშნული."
+        });
+      })
     ),
     
     exportModal === "password" && React.createElement(PasswordPromptModal, {
@@ -4724,6 +5372,7 @@ function QAAuditPlatform() {
   const lockKeyInMemory = async (key) => {
     try {
       const locked = await toNonExtractableKey(key);
+      console.log('[v2.0] Encryption key locked in memory (non-extractable, not persisted)');
       return locked;
     } catch (err) {
       console.error('[v2.0] lockKeyInMemory failed:', err);
@@ -4871,7 +5520,7 @@ function QAAuditPlatform() {
     setStoragePersisted(null);
 
     try { sessionStorage.removeItem('qa_session_key'); } catch (_) {}
-
+    console.log('[v2.0] Platform reset completed');
   }, []);
 
   const handleRegistration = async (key, initialData, email) => {
@@ -4903,6 +5552,13 @@ function QAAuditPlatform() {
     setUser({ email });
     setInitState('logged-in');
 
+    try {
+      const encryptedPayload = await CryptoModule.encryptData(decryptedData, lockedKey);
+      await SecureStorage.saveEncryptedData(encryptedPayload);
+    } catch (e) {
+      console.warn('[id-model] could not persist migrated data on login', e);
+    }
+
     setTimeout(() => setLoadProgress(0), 500);
   };
 
@@ -4929,6 +5585,7 @@ function QAAuditPlatform() {
     if (data && encryptionKey) {
       const autoSaveInterval = setInterval(() => {
         if (isDirty() && encryptionKeyRef.current && dataRef.current) {
+          console.log('[v2.0] Auto-save triggered (dirty)');
           flushPendingSave();
         }
       }, 5 * 60 * 1000);
@@ -4977,6 +5634,7 @@ function QAAuditPlatform() {
       setSelectedCategory("");
 
       if (typeof window !== 'undefined' && window.gc) {
+        console.log('[v2.0] Triggering garbage collection');
         window.gc();
       }
     }
