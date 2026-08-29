@@ -1,8 +1,13 @@
+<!--
+  QA აუდიტის პლათფორმა
+  Author: თამუნა ვეფხვაძე
+-->
 <!DOCTYPE html>
 <html lang="ka">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="author" content="თამუნა ვეფხვაძე">
 <title>QA აუდიტის პლათფორმა </title>
 <link rel="icon" type="image/x-icon" href="LB.ico">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -484,6 +489,7 @@ const SEED_DATA = {
   departments: [],
   helpTypes: [],
   delayReasons: [],
+  consultations: [],
   statuses: [],
   auditResults: [],
   incidentTypes: [],
@@ -491,7 +497,27 @@ const SEED_DATA = {
   cases: [],
   incidents: [],
   responsibleName: "",
-  responsiblePosition: ""
+  responsiblePosition: "",
+  excelConsultExportScope: "both",
+  incidentTaskPrefs: {
+    taskFieldEnabled: false,
+    showOnPanel: false,
+    taskExportExcel: false
+  }
+};
+
+const DEFAULT_CONSULTATIONS = [
+  { id: "cs_none", label: "არ საჭიროებს" },
+  { id: "cs_manager", label: "ხელმძღვანელთან" },
+  { id: "cs_colleague", label: "კოლეგასთან" },
+  { id: "cs_personal", label: "პირადი მონიშვნა" }
+];
+
+const KNOWN_CONSULTATION_IDS = {
+  "არ საჭიროებს": "cs_none",
+  "ხელმძღვანელთან": "cs_manager",
+  "კოლეგასთან": "cs_colleague",
+  "პირადი მონიშვნა": "cs_personal"
 };
 
 /* ================================================================== */
@@ -517,7 +543,6 @@ const STATUS_COLOR = {
   st_closed:   { fg: "#1F6F50", bg: "#E4F1EA", ring: "#1F6F50" },
   st_progress: { fg: "#B8860B", bg: "#FBF1DA", ring: "#B8860B" },
   st_review:   { fg: "#2A4270", bg: "#E6EBF4", ring: "#2A4270" },
-  // legacy label keys (pre-migration reads)
   "დახურულია": { fg: "#1F6F50", bg: "#E4F1EA", ring: "#1F6F50" },
   "მიმდინარეობს": { fg: "#B8860B", bg: "#FBF1DA", ring: "#B8860B" },
   "განხილვაშია": { fg: "#2A4270", bg: "#E6EBF4", ring: "#2A4270" }
@@ -572,12 +597,10 @@ function ensureIdList(arr, knownMap) {
     } else {
       return;
     }
-    // merge typo variants into known stable ids
     if (knownMap[label]) id = knownMap[label];
     if (seenIds.has(id) || seenLabels.has(label)) return;
     seenIds.add(id);
     seenLabels.add(label);
-    // only one default per list
     if (isDefault && defaultAssigned) isDefault = false;
     if (isDefault) defaultAssigned = true;
     out.push({ id, label, isDefault: !!isDefault });
@@ -591,7 +614,6 @@ function getDefaultId(list) {
   return hit ? hit.id : "";
 }
 
-/** Toggle default: click same id clears; otherwise only that id is default. */
 function setDefaultInList(list, id) {
   if (!Array.isArray(list)) return [];
   const current = list.find(x => x && x.isDefault);
@@ -635,7 +657,7 @@ function ensureRefOnList(list, label, knownMap) {
 function migrateCase(c, ctx) {
   if (!c || typeof c !== "object") return null;
 
-  let { statuses, categories, departments, helpTypes, delayReasons, auditResults, employees } = ctx;
+  let { statuses, categories, departments, helpTypes, delayReasons, consultations, auditResults, employees } = ctx;
 
   const pick = (list, idField, legacyField, knownMap) => {
     if (c[idField] && findInList(list, c[idField])) return { list, id: c[idField] };
@@ -663,6 +685,25 @@ function migrateCase(c, ctx) {
   r = pick(delayReasons, "delayReasonId", "delayReason", null);
   delayReasons = r.list; const delayReasonId = r.id;
 
+  let consultationIds = Array.isArray(c.consultationIds) ? [...c.consultationIds] : [];
+  if (!consultationIds.length && c.consultationId) consultationIds = [c.consultationId];
+  if (!consultationIds.length && c.consultation) {
+    String(c.consultation).split(/,\s*/).forEach(part => {
+      const p = part.trim();
+      if (!p) return;
+      const found = findInList(consultations, p);
+      if (found) {
+        if (!consultationIds.includes(found.id)) consultationIds.push(found.id);
+      } else {
+        const added = ensureRefOnList(consultations, p, KNOWN_CONSULTATION_IDS);
+        consultations = added.list;
+        if (!consultationIds.includes(added.id)) consultationIds.push(added.id);
+      }
+    });
+  }
+  consultationIds = consultationIds.filter(id => findInList(consultations, id));
+  const consultationId = consultationIds[0] || "";
+
   r = pick(auditResults, "auditResultId", "auditResult", KNOWN_AUDIT_IDS);
   auditResults = r.list; const auditResultId = r.id;
 
@@ -683,32 +724,38 @@ function migrateCase(c, ctx) {
   ctx.departments = departments;
   ctx.helpTypes = helpTypes;
   ctx.delayReasons = delayReasons;
+  ctx.consultations = consultations;
   ctx.auditResults = auditResults;
   ctx.employees = employees;
 
-  return {
+  return applyMarksToRecord({
     ...c,
     statusId,
     categoryId,
     departmentId,
     helpTypeId,
     delayReasonId,
+    consultationIds,
+    consultationId,
     auditResultId,
     operatorId,
-    // keep legacy string fields in sync for any leftover readers / exports safety
+    consultationExport: c.consultationExport === true,
+    task: typeof c.task === "string" ? c.task : "",
+    showOnPanel: c.showOnPanel === true,
     status: labelOf(statuses, statusId),
     category: labelOf(categories, categoryId),
     department: labelOf(departments, departmentId),
     helpType: labelOf(helpTypes, helpTypeId),
     delayReason: labelOf(delayReasons, delayReasonId),
+    consultation: labelsOfIds(consultations, consultationIds),
     auditResult: labelOf(auditResults, auditResultId),
     operator: (employees.find(e => e.id === operatorId) || {}).name || ""
-  };
+  });
 }
 
 function migrateIncident(inc, ctx) {
   if (!inc || typeof inc !== "object") return null;
-  let { incidentTypes, employees } = ctx;
+  let { incidentTypes, employees, consultations, statuses } = ctx;
 
   let incidentTypeId = inc.incidentTypeId || "";
   if (incidentTypeId && !findInList(incidentTypes, incidentTypeId)) incidentTypeId = "";
@@ -721,6 +768,41 @@ function migrateIncident(inc, ctx) {
       incidentTypeId = id;
     }
   }
+
+  let statusId = inc.statusId || "";
+  if (statusId && !findInList(statuses, statusId)) statusId = "";
+  if (!statusId && inc.status) {
+    const found = findInList(statuses, inc.status);
+    if (found) statusId = found.id;
+    else {
+      const known = KNOWN_STATUS_IDS[inc.status];
+      if (known) statusId = known;
+      else {
+        const id = newRefId("ref");
+        statuses = [...statuses, { id, label: String(inc.status) }];
+        statusId = id;
+      }
+    }
+  }
+
+  let consultationIds = Array.isArray(inc.consultationIds) ? [...inc.consultationIds] : [];
+  if (!consultationIds.length && inc.consultationId) consultationIds = [inc.consultationId];
+  if (!consultationIds.length && inc.consultation) {
+    String(inc.consultation).split(/,\s*/).forEach(part => {
+      const p = part.trim();
+      if (!p) return;
+      const found = findInList(consultations, p);
+      if (found) {
+        if (!consultationIds.includes(found.id)) consultationIds.push(found.id);
+      } else {
+        const added = ensureRefOnList(consultations, p, KNOWN_CONSULTATION_IDS);
+        consultations = added.list;
+        if (!consultationIds.includes(added.id)) consultationIds.push(added.id);
+      }
+    });
+  }
+  consultationIds = consultationIds.filter(id => findInList(consultations, id));
+  const consultationId = consultationIds[0] || "";
 
   let employeeId = inc.employeeId || "";
   if (employeeId && !employees.find(e => e.id === employeeId)) employeeId = "";
@@ -735,15 +817,28 @@ function migrateIncident(inc, ctx) {
   }
 
   ctx.incidentTypes = incidentTypes;
+  ctx.consultations = consultations;
   ctx.employees = employees;
+  ctx.statuses = statuses;
 
-  return {
+  return applyMarksToRecord({
     ...inc,
     incidentTypeId,
+    statusId,
+    consultationIds,
+    consultationId,
     employeeId,
+    task: typeof inc.task === "string" ? inc.task : "",
+    taskFieldEnabled: inc.taskFieldEnabled === true,
+    showOnPanel: inc.showOnPanel === true,
+    taskExportExcel: inc.taskExportExcel === true,
+    auditDate: inc.auditDate || "",
+    incidentDate: inc.incidentDate || "",
     incidentType: labelOf(incidentTypes, incidentTypeId),
+    status: labelOf(statuses, statusId),
+    consultation: labelsOfIds(consultations, consultationIds),
     employee: (employees.find(e => e.id === employeeId) || {}).name || ""
-  };
+  });
 }
 
 function normalizeData(raw) {
@@ -755,6 +850,7 @@ function normalizeData(raw) {
     departments: ensureIdList(safeArr(raw?.departments, [])),
     helpTypes: ensureIdList(safeArr(raw?.helpTypes, [])),
     delayReasons: ensureIdList(safeArr(raw?.delayReasons, [])),
+    consultations: ensureIdList(safeArr(raw?.consultations, []), KNOWN_CONSULTATION_IDS),
     statuses: ensureIdList(safeArr(raw?.statuses, []), KNOWN_STATUS_IDS),
     auditResults: ensureIdList(safeArr(raw?.auditResults, []), KNOWN_AUDIT_IDS),
     incidentTypes: ensureIdList(safeArr(raw?.incidentTypes, [])),
@@ -769,6 +865,7 @@ function normalizeData(raw) {
     departments: ctx.departments,
     helpTypes: ctx.helpTypes,
     delayReasons: ctx.delayReasons,
+    consultations: ctx.consultations,
     statuses: ctx.statuses,
     auditResults: ctx.auditResults,
     incidentTypes: ctx.incidentTypes,
@@ -776,11 +873,18 @@ function normalizeData(raw) {
     cases,
     incidents,
     responsibleName: safeStr(raw?.responsibleName),
-    responsiblePosition: safeStr(raw?.responsiblePosition)
+    responsiblePosition: safeStr(raw?.responsiblePosition),
+    excelConsultExportScope: (["both", "cases", "incidents", "none"].includes(raw?.excelConsultExportScope)
+      ? raw.excelConsultExportScope
+      : "both"),
+    incidentTaskPrefs: {
+      taskFieldEnabled: raw?.incidentTaskPrefs?.taskFieldEnabled === true,
+      showOnPanel: raw?.incidentTaskPrefs?.showOnPanel === true,
+      taskExportExcel: raw?.incidentTaskPrefs?.taskExportExcel === true
+    }
   };
 }
 
-/** Re-sync denormalized label fields from current lists (call after rename). */
 function resyncLabels(data) {
   const cases = (data.cases || []).map(c => ({
     ...c,
@@ -789,15 +893,41 @@ function resyncLabels(data) {
     department: labelOf(data.departments, c.departmentId),
     helpType: labelOf(data.helpTypes, c.helpTypeId),
     delayReason: labelOf(data.delayReasons, c.delayReasonId),
+    consultationIds: Array.isArray(c.consultationIds) ? c.consultationIds : (c.consultationId ? [c.consultationId] : []),
+    consultation: labelsOfIds(data.consultations, Array.isArray(c.consultationIds) ? c.consultationIds : (c.consultationId ? [c.consultationId] : [])),
     auditResult: labelOf(data.auditResults, c.auditResultId),
     operator: (data.employees.find(e => e.id === c.operatorId) || {}).name || ""
   }));
   const incidents = (data.incidents || []).map(i => ({
     ...i,
+    consultationIds: Array.isArray(i.consultationIds) ? i.consultationIds : (i.consultationId ? [i.consultationId] : []),
     incidentType: labelOf(data.incidentTypes, i.incidentTypeId),
+    status: labelOf(data.statuses, i.statusId),
+    consultation: labelsOfIds(data.consultations, Array.isArray(i.consultationIds) ? i.consultationIds : (i.consultationId ? [i.consultationId] : [])),
     employee: (data.employees.find(e => e.id === i.employeeId) || {}).name || ""
   }));
   return { ...data, cases, incidents };
+}
+
+function normalizeMarks(rec) {
+  if (!rec || typeof rec !== "object") {
+    return { personalStar: false, personalStarNote: "", critical: false, criticalNote: "" };
+  }
+  const personalStar = !!(rec.personalStar || rec.protocolCompliant);
+  const critical = !!rec.critical;
+  return {
+    personalStar,
+    personalStarNote: personalStar ? String(rec.personalStarNote || "").trim() : "",
+    critical,
+    criticalNote: critical ? String(rec.criticalNote || "").trim() : ""
+  };
+}
+
+function applyMarksToRecord(rec) {
+  const m = normalizeMarks(rec);
+  const out = { ...rec, ...m };
+  delete out.protocolCompliant;
+  return out;
 }
 
 function isStatusClosed(c) {
@@ -969,6 +1099,33 @@ function excelColLetter(n) {
   return s;
 }
 
+/** Estimate row height from cell values + column widths (ExcelJS has no true auto-fit).
+ *  Tuned for Calibri ~11pt: width unit ≈ 1 char; avoid excess white space. */
+function estimateExcelRowHeight(values, colWidths, opts) {
+  const minH = (opts && opts.min) || 18;
+  const maxH = (opts && opts.max) || 80;
+  const lineH = (opts && opts.lineHeight) || 13;
+  let maxLines = 1;
+  (values || []).forEach((v, i) => {
+    let text = "";
+    if (v == null) text = "";
+    else if (typeof v === "object" && v.text != null) text = String(v.text);
+    else text = String(v);
+    text = text.trim();
+    if (!text) return;
+    const width = (colWidths && colWidths[i]) || 20;
+    const charsPerLine = Math.max(Math.floor(width * 0.95), 8);
+    const parts = text.split(/\r?\n/);
+    let lines = 0;
+    for (let p = 0; p < parts.length; p++) {
+      const len = parts[p].length;
+      lines += len === 0 ? 1 : Math.ceil(len / charsPerLine);
+    }
+    if (lines > maxLines) maxLines = lines;
+  });
+  if (maxLines <= 1) return minH;
+  return Math.min(maxH, minH + (maxLines - 1) * lineH);
+}
 
 function paintExcelBanner(sheet, navyArgb, dataColCount) {
   const cols = Math.max(dataColCount || 10, 2);
@@ -1050,6 +1207,15 @@ function formatDate(dateStr) {
   return `${d}.${m}.${y}`;
 }
 
+function truncateTaskPreview(text, maxWords) {
+  maxWords = maxWords || 4;
+  const t = String(text || "").trim();
+  if (!t) return "";
+  const words = t.split(/\s+/);
+  if (words.length <= maxWords) return t;
+  return words.slice(0, maxWords).join(" ") + "…";
+}
+
 function formatDateTime(iso) {
   if (!iso) return "—";
   try {
@@ -1060,7 +1226,10 @@ function formatDateTime(iso) {
   }
 }
 
-const BACKUP_REMINDER_DAYS = 7;
+const BACKUP_REMINDER_DAYS = 7; 
+const BACKUP_REMINDER_HOUR = 17;
+const BACKUP_REMINDER_MINUTE = 0; 
+const BACKUP_REMINDER_DATE_KEY = "qa_last_backup_reminder_date";
 
 function daysSince(iso) {
   if (!iso) return null;
@@ -1068,9 +1237,75 @@ function daysSince(iso) {
   return Math.floor(diffMs / (1000 * 60 * 60 * 24));
 }
 
+function toLocalDateISO(d) {
+  const x = d instanceof Date ? d : new Date(d);
+  if (Number.isNaN(x.getTime())) return "";
+  return `${x.getFullYear()}-${pad2(x.getMonth() + 1)}-${pad2(x.getDate())}`;
+}
+
+function isWeekdayLocal(now) {
+  const day = (now || new Date()).getDay(); 
+  return day >= 1 && day <= 5;
+}
+
+function isAtOrAfterBackupReminderTime(now) {
+  const n = now || new Date();
+  return (n.getHours() * 60 + n.getMinutes()) >= (BACKUP_REMINDER_HOUR * 60 + BACKUP_REMINDER_MINUTE);
+}
+
+function backedUpToday(lastBackupAt, now) {
+  if (!lastBackupAt) return false;
+  const today = toLocalDateISO(now || new Date());
+  const backupDay = toLocalDateISO(new Date(lastBackupAt));
+  return !!today && backupDay === today;
+}
+
+function previousWeekdayDate(now) {
+  const cursor = new Date(now || new Date());
+  cursor.setHours(0, 0, 0, 0);
+  cursor.setDate(cursor.getDate() - 1);
+  for (let i = 0; i < 8; i++) {
+    const day = cursor.getDay();
+    if (day >= 1 && day <= 5) return cursor;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return cursor;
+}
+
+/**
+ * Calendar-day backup coverage (Mon–Fri only; weekends never show).
+ * - After 17:00 today: show if no backup today.
+ * - Before 17:00: show only if previous weekday had zero backups
+ *   (any backup that calendar day fully covers it, any hour).
+ */
+function shouldShowBackupReminder(lastBackupAt, now) {
+  const n = now || new Date();
+  if (!isWeekdayLocal(n)) return false;
+  if (backedUpToday(lastBackupAt, n)) return false;
+
+  if (isAtOrAfterBackupReminderTime(n)) return true;
+
+  if (!lastBackupAt) return true;
+  const backupTime = new Date(lastBackupAt);
+  if (Number.isNaN(backupTime.getTime())) return true;
+  const backupDay = toLocalDateISO(backupTime);
+  const prevWorkday = toLocalDateISO(previousWeekdayDate(n));
+  return backupDay < prevWorkday;
+}
+
+function getLastBackupReminderDate() {
+  try { return localStorage.getItem(BACKUP_REMINDER_DATE_KEY) || ""; }
+  catch (_) { return ""; }
+}
+
+function markBackupReminderShownToday(now) {
+  try { localStorage.setItem(BACKUP_REMINDER_DATE_KEY, toLocalDateISO(now || new Date())); }
+  catch (_) {}
+}
+
+/** @deprecated use shouldShowBackupReminder — kept for any residual callers */
 function isBackupStale(lastBackupAt) {
-  const d = daysSince(lastBackupAt);
-  return d === null || d >= BACKUP_REMINDER_DAYS;
+  return shouldShowBackupReminder(lastBackupAt);
 }
 
 /* ================================================================== */
@@ -1101,10 +1336,14 @@ function getResponsiblePersonLines(data) {
   return { primary: name, secondary: position };
 }
 
-function tally(list, key) {
+function tally(list, key, emptyLabel) {
+  const empty = emptyLabel !== undefined ? emptyLabel : "შეფერხების გარეშე ✓";
   const map = {};
   list.forEach(item => {
-    const v = item[key] || "შეფერხების გარეშე ✓";
+    const raw = item[key];
+    const v = (raw !== undefined && raw !== null && String(raw).trim() !== "")
+      ? String(raw)
+      : empty;
     map[v] = (map[v] || 0) + 1;
   });
   return Object.entries(map).sort((a, b) => b[1] - a[1]);
@@ -1218,6 +1457,295 @@ function Field({ label, children, hint }) {
     children,
     hint && React.createElement("p", { className: "text-xs text-[#9A967F] mt-0.5" }, hint)
   );
+}
+
+/** Searchable dropdown: full list on open + inline filter at top of panel.
+ *  Optional className (root width), allowWrap (show long labels fully). */
+function SearchableSelect({ options, value, onChange, placeholder, className, allowWrap }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const rootRef = useRef(null);
+  const searchRef = useRef(null);
+
+  const selected = (options || []).find(o => o.value === value);
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return options || [];
+    return (options || []).filter(o => (o.label || "").toLowerCase().includes(q));
+  }, [options, query]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e) => {
+      if (rootRef.current && !rootRef.current.contains(e.target)) {
+        setOpen(false);
+        setQuery("");
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  useEffect(() => {
+    if (open && searchRef.current) {
+      setTimeout(() => searchRef.current && searchRef.current.focus(), 0);
+    }
+  }, [open]);
+
+  const pick = (val) => {
+    onChange(val);
+    setOpen(false);
+    setQuery("");
+  };
+
+  const labelCls = selected
+    ? (allowWrap ? "text-[#2C2B24] text-left break-words whitespace-normal" : "text-[#2C2B24] truncate")
+    : "text-[#9A967F] truncate";
+
+  return React.createElement("div", {
+    className: "relative" + (className ? " " + className : ""),
+    ref: rootRef
+  },
+    React.createElement("button", {
+      type: "button",
+      onClick: () => setOpen(o => !o),
+      className: inputCls + " text-left flex items-center justify-between gap-2 cursor-pointer" + (allowWrap ? " min-h-[42px] h-auto py-2" : "")
+    },
+      React.createElement("span", { className: labelCls },
+        selected ? selected.label : (placeholder || "— აირჩიე —")),
+      React.createElement(Icon, {
+        name: open ? "expand_less" : "expand_more",
+        size: 18,
+        className: "text-[#8A8672] shrink-0"
+      })
+    ),
+    open && React.createElement("div", {
+      className: "absolute z-50 left-0 right-0 mt-1 bg-white border border-[#DBD7C8] rounded-md shadow-lg overflow-hidden min-w-full"
+    },
+      React.createElement("div", { className: "p-2 border-b border-[#EEEBDF]" },
+        React.createElement("div", { className: "relative" },
+          React.createElement(Icon, {
+            name: "search",
+            size: 15,
+            className: "absolute left-2.5 top-1/2 -translate-y-1/2 text-[#9A967F]"
+          }),
+          React.createElement("input", {
+            ref: searchRef,
+            className: "w-full pl-8 pr-3 py-1.5 rounded-md border border-[#DBD7C8] bg-white text-sm focus:outline-none focus:ring-2 focus:ring-[#B8860B]/40",
+            placeholder: "ძებნა სახელი / გვარი…",
+            value: query,
+            onChange: e => setQuery(e.target.value),
+            onKeyDown: e => {
+              if (e.key === "Escape") {
+                setOpen(false);
+                setQuery("");
+              }
+            }
+          })
+        )
+      ),
+      React.createElement("div", {
+        className: "qa-scroll",
+        style: { maxHeight: 288, overflowY: "auto" }
+      },
+        React.createElement("button", {
+          type: "button",
+          onClick: () => pick(""),
+          className: `w-full text-left px-3 py-2 text-sm hover:bg-[#FBF9F3] ${!value ? "bg-[#F3F1E7] font-semibold text-[#16213E]" : "text-[#6B6A5C]"}`
+        }, placeholder || "— აირჩიე —"),
+        filtered.map(o => React.createElement("button", {
+          type: "button",
+          key: o.value,
+          onClick: () => pick(o.value),
+          className: `w-full text-left px-3 py-2 text-sm hover:bg-[#FBF9F3] ${allowWrap ? "whitespace-normal break-words" : ""} ${o.value === value ? "bg-[#F3F1E7] font-semibold text-[#16213E]" : "text-[#2C2B24]"}`
+        }, o.label)),
+        filtered.length === 0 && React.createElement("p", {
+          className: "px-3 py-3 text-xs text-[#9A967F] italic"
+        }, "შედეგი არ მოიძებნა")
+      )
+    )
+  );
+}
+
+function MultiSearchableSelect({ options, value, onChange, placeholder }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const rootRef = useRef(null);
+  const searchRef = useRef(null);
+  const selectedIds = Array.isArray(value) ? value.filter(Boolean) : (value ? [value] : []);
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return options || [];
+    return (options || []).filter(o => (o.label || "").toLowerCase().includes(q));
+  }, [options, query]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e) => {
+      if (rootRef.current && !rootRef.current.contains(e.target)) {
+        setOpen(false);
+        setQuery("");
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  useEffect(() => {
+    if (open && searchRef.current) {
+      setTimeout(() => searchRef.current && searchRef.current.focus(), 0);
+    }
+  }, [open]);
+
+  const toggle = (val) => {
+    if (!val) return;
+    let next;
+    if (selectedSet.has(val)) next = selectedIds.filter(id => id !== val);
+    else next = [...selectedIds, val];
+    onChange(next);
+  };
+
+  const remove = (val) => {
+    onChange(selectedIds.filter(id => id !== val));
+  };
+
+  const selectedOpts = selectedIds
+    .map(id => (options || []).find(o => o.value === id))
+    .filter(Boolean);
+
+  return React.createElement("div", { className: "relative", ref: rootRef },
+    React.createElement("button", {
+      type: "button",
+      onClick: () => setOpen(o => !o),
+      className: inputCls + " text-left flex items-center justify-between gap-2 cursor-pointer min-h-[42px]"
+    },
+      React.createElement("span", {
+        className: selectedOpts.length ? "text-[#2C2B24] truncate" : "text-[#9A967F] truncate"
+      }, selectedOpts.length
+        ? `${selectedOpts.length} არჩეული`
+        : (placeholder || "— აირჩიე —")),
+      React.createElement(Icon, {
+        name: open ? "expand_less" : "expand_more",
+        size: 18,
+        className: "text-[#8A8672] shrink-0"
+      })
+    ),
+    selectedOpts.length > 0 && React.createElement("div", {
+      className: "flex flex-wrap gap-1.5 mt-2"
+    },
+      selectedOpts.map(o => React.createElement("span", {
+        key: o.value,
+        className: "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-[#E6EBF4] text-[#2A4270]"
+      },
+        o.label,
+        React.createElement("button", {
+          type: "button",
+          onClick: e => { e.stopPropagation(); remove(o.value); },
+          className: "p-0.5 rounded-full hover:bg-[#D0D8EC] leading-none",
+          title: "მოხსნა"
+        }, React.createElement(Icon, { name: "close", size: 12 }))
+      ))
+    ),
+    open && React.createElement("div", {
+      className: "absolute z-50 left-0 right-0 mt-1 bg-white border border-[#DBD7C8] rounded-md shadow-lg overflow-hidden"
+    },
+      React.createElement("div", { className: "p-2 border-b border-[#EEEBDF]" },
+        React.createElement("div", { className: "relative" },
+          React.createElement(Icon, {
+            name: "search",
+            size: 15,
+            className: "absolute left-2.5 top-1/2 -translate-y-1/2 text-[#9A967F]"
+          }),
+          React.createElement("input", {
+            ref: searchRef,
+            className: "w-full pl-8 pr-3 py-1.5 rounded-md border border-[#DBD7C8] bg-white text-sm focus:outline-none focus:ring-2 focus:ring-[#B8860B]/40",
+            placeholder: "ძებნა…",
+            value: query,
+            onChange: e => setQuery(e.target.value),
+            onKeyDown: e => {
+              if (e.key === "Escape") {
+                setOpen(false);
+                setQuery("");
+              }
+            }
+          })
+        )
+      ),
+      React.createElement("div", {
+        className: "qa-scroll",
+        style: { maxHeight: 288, overflowY: "auto" }
+      },
+        filtered.map(o => {
+          const isOn = selectedSet.has(o.value);
+          return React.createElement("button", {
+            type: "button",
+            key: o.value,
+            onClick: () => toggle(o.value),
+            className: `w-full text-left px-3 py-2 text-sm hover:bg-[#FBF9F3] flex items-center gap-2 ${isOn ? "bg-[#F3F1E7] font-semibold text-[#16213E]" : "text-[#2C2B24]"}`
+          },
+            React.createElement("span", {
+              className: `w-4 h-4 rounded border flex items-center justify-center shrink-0 ${isOn ? "bg-[#16213E] border-[#16213E]" : "border-[#DBD7C8] bg-white"}`
+            }, isOn && React.createElement(Icon, { name: "check", size: 12, className: "text-white" })),
+            o.label
+          );
+        }),
+        filtered.length === 0 && React.createElement("p", {
+          className: "px-3 py-3 text-xs text-[#9A967F] italic"
+        }, "შედეგი არ მოიძებნა")
+      )
+    )
+  );
+}
+
+function labelsOfIds(list, ids) {
+  if (!Array.isArray(ids) || !ids.length) return "";
+  return ids.map(id => labelOf(list, id)).filter(Boolean).join(", ");
+}
+
+function resolveConsultationIds(rec, consultations) {
+  const list = consultations || [];
+  const out = [];
+  const push = (idOrLabel) => {
+    if (!idOrLabel) return;
+    const found = findInList(list, idOrLabel);
+    if (found && !out.includes(found.id)) out.push(found.id);
+  };
+  if (Array.isArray(rec.consultationIds)) {
+    rec.consultationIds.forEach(push);
+  }
+  if (rec.consultationId) push(rec.consultationId);
+  if (rec.consultation && !out.length) {
+    String(rec.consultation).split(/,\s*/).forEach(p => push(p.trim()));
+  }
+  return out;
+}
+
+function tallyConsultationMulti(records, consultations, emptyLabel) {
+  const empty = emptyLabel || "ადრესატი მითითებული არ არის";
+  const map = {};
+  (records || []).forEach(item => {
+    const ids = Array.isArray(item.consultationIds) ? item.consultationIds.filter(Boolean) : [];
+    if (ids.length) {
+      ids.forEach(id => {
+        const lab = (consultations && labelOf(consultations, id)) || id;
+        map[lab] = (map[lab] || 0) + 1;
+      });
+      return;
+    }
+    const text = (item.consultation || "").trim();
+    if (text) {
+      text.split(/,\s*/).forEach(lab => {
+        const t = lab.trim();
+        if (!t) return;
+        map[t] = (map[t] || 0) + 1;
+      });
+      return;
+    }
+    map[empty] = (map[empty] || 0) + 1;
+  });
+  return Object.entries(map).sort((a, b) => b[1] - a[1]);
 }
 
 function StatusBadge({ status, statusId, size = "md" }) {
@@ -1390,6 +1918,123 @@ function Modal({ title, onClose, children, wide, size, closeOnBackdrop = true })
       React.createElement("div", { className: `px-6 ${roomy ? "py-6" : "py-5"}` }, children)
     )
   );
+}
+
+function MarkFieldsEditor({ form, setForm }) {
+  const toggle = (key, noteKey) => {
+    const next = !form[key];
+    setForm({
+      ...form,
+      [key]: next,
+      [noteKey]: next ? (form[noteKey] || "") : ""
+    });
+  };
+  return React.createElement("div", { className: "col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4" },
+    React.createElement("div", { className: "flex flex-col gap-2" },
+      React.createElement("button", {
+        type: "button",
+        onClick: () => toggle("personalStar", "personalStarNote"),
+        className: "w-full flex items-center gap-3 px-4 py-3 rounded-md border border-[#EADFB8] bg-[#FBF6E7] hover:bg-[#EFEDE2] transition-colors"
+      },
+        React.createElement(Icon, {
+          name: "star",
+          size: 26,
+          filled: !!form.personalStar,
+          className: "shrink-0",
+          style: { color: form.personalStar ? "#FFC107" : "#3A3A32" }
+        }),
+        React.createElement("div", { className: "text-left" },
+          React.createElement("p", { className: "text-sm font-semibold", style: { color: form.personalStar ? "#8C6B21" : "#3A3A32" } },
+            "პირადი მონიშვნა ⭐"
+          ),
+          React.createElement("p", { className: "text-[11px] text-[#9A967F]" }, "მხოლოდ თქვენთვის · Excel/PDF-ში არ გადადის")
+        )
+      ),
+      form.personalStar && React.createElement("textarea", {
+        rows: 2,
+        className: inputCls,
+        placeholder: "კომენტარი (არასავალდებულო)…",
+        value: form.personalStarNote || "",
+        onChange: e => setForm({ ...form, personalStarNote: e.target.value })
+      })
+    ),
+    React.createElement("div", { className: "flex flex-col gap-2" },
+      React.createElement("button", {
+        type: "button",
+        onClick: () => toggle("critical", "criticalNote"),
+        className: "w-full flex items-center gap-3 px-4 py-3 rounded-md border border-[#F0C8C2] bg-[#FDF5F4] hover:bg-[#F6E4E1] transition-colors"
+      },
+        React.createElement(Icon, {
+          name: "circle",
+          size: 22,
+          filled: !!form.critical,
+          className: "shrink-0",
+          style: { color: form.critical ? "#C0392B" : "#3A3A32" }
+        }),
+        React.createElement("div", { className: "text-left" },
+          React.createElement("p", { className: "text-sm font-semibold", style: { color: form.critical ? "#C0392B" : "#3A3A32" } },
+            "საჯარო მონიშვნა 🔴"
+          ),
+          React.createElement("p", { className: "text-[11px] text-[#9A967F]" }, "საერთო · აისახება Excel/PDF-ში")
+        )
+      ),
+      form.critical && React.createElement("textarea", {
+        rows: 2,
+        className: inputCls,
+        placeholder: "საჯარო შენიშვნა (არასავალდებულო)…",
+        value: form.criticalNote || "",
+        onChange: e => setForm({ ...form, criticalNote: e.target.value })
+      })
+    )
+  );
+}
+
+function MarkIcons({ record, onOpen }) {
+  if (!record) return null;
+  const hasP = !!record.personalStar;
+  const hasC = !!record.critical;
+  if (!hasP && !hasC) return null;
+  return React.createElement("span", {
+    className: "inline-flex items-center gap-0.5 shrink-0",
+    onClick: e => e.stopPropagation()
+  },
+    hasP && React.createElement("button", {
+      type: "button",
+      title: "პირადი მონიშვნა",
+      onClick: e => { e.stopPropagation(); onOpen && onOpen("personal", record); },
+      className: "p-0.5 rounded hover:bg-[#FBF1DA]"
+    }, React.createElement(Icon, { name: "star", size: 20, filled: true, style: { color: "#FFC107" } })),
+    hasC && React.createElement("button", {
+      type: "button",
+      title: "საჯარო მონიშვნა",
+      onClick: e => { e.stopPropagation(); onOpen && onOpen("critical", record); },
+      className: "p-0.5 rounded hover:bg-[#F6E4E1]"
+    }, React.createElement(Icon, { name: "circle", size: 18, filled: true, style: { color: "#C0392B" } }))
+  );
+}
+
+function MarkNoteModal({ kind, record, onClose }) {
+  if (!record || !kind) return null;
+  const isPersonal = kind === "personal";
+  const title = isPersonal ? "პირადი მონიშვნა ⭐" : "საჯარო მონიშვნა 🔴";
+  const note = isPersonal ? (record.personalStarNote || "") : (record.criticalNote || "");
+  return React.createElement(Modal, { title, onClose, size: null },
+    React.createElement("p", {
+      className: "text-sm text-[#3A3A32]",
+      style: { whiteSpace: "pre-wrap", minHeight: 40 }
+    }, note.trim() ? note : "კომენტარი არ არის")
+  );
+}
+
+function markFilterMatch(rec, markFilter) {
+  if (!markFilter) return true;
+  const p = !!rec.personalStar;
+  const c = !!rec.critical;
+  if (markFilter === "personal") return p;
+  if (markFilter === "critical") return c;
+  if (markFilter === "both") return p && c;
+  if (markFilter === "none") return !p && !c;
+  return true;
 }
 
 function ConfirmDialog({ text, onConfirm, onCancel }) {
@@ -2096,7 +2741,6 @@ function LoginPage({ userEmail, onLogin, onReset }) {
             newEncryptedPayload
           );
           encryptionKey = migrated.encryptionKey;
-          console.log('[security] Account migrated to v2 credential scheme');
         } catch (migrationErr) {
           console.warn('[security] v2 migration skipped, will retry next login:', migrationErr);
         }
@@ -2278,6 +2922,7 @@ function CaseDetailRow({ label, value }) {
 }
 
 function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSelect, onToggleSelectAll, onPageChange, onBulkDelete }) {
+  const [markModal, setMarkModal] = useState(null); // { kind, record }
   const [expanded, setExpanded] = useState(null);
   const [currentPage, setCurrentPage] = useState(0);
   const ITEMS_PER_PAGE = 100;
@@ -2309,7 +2954,7 @@ function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSel
     );
   }
   
-  const colCount = 6 + (!compact ? 1 : 0) + (onEdit || onDelete ? 1 : 0) + (selectable ? 1 : 0);
+  const colCount = 4 + (!compact ? 1 : 0) + (onEdit || onDelete ? 1 : 0) + (selectable ? 1 : 0);
 
   const goPage = (next) => {
     setCurrentPage(next);
@@ -2365,7 +3010,7 @@ function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSel
     ),
     
     React.createElement("div", { className: "overflow-x-auto qa-scroll" },
-      React.createElement("table", { className: "w-full text-sm border-collapse min-w-[860px]" },
+      React.createElement("table", { className: "w-full text-sm border-collapse min-w-[560px]" },
         React.createElement("thead", null,
           React.createElement("tr", {
             className: "text-left text-[10px] uppercase tracking-wider text-[#8A8672] border-b border-[#E4E1D6]"
@@ -2374,9 +3019,7 @@ function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSel
             React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "№"),
             React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "ინც. თარიღი"),
             React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "Jira №"),
-            !compact && React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "ოპერატორი"),
-            React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "კატეგორია"),
-            React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "გამოვლენილი პრობლემა"),
+            !compact && React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "სახელი, გვარი"),
             React.createElement("th", { className: "py-2 pr-3 font-semibold" }, "აუდიტის შედეგი"),
             (onEdit || onDelete) && React.createElement("th", { className: "py-2 pr-1 font-semibold text-right" }, "მოქმედება")
           )
@@ -2408,6 +3051,10 @@ function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSel
                       size: 14,
                       className: `transition-transform duration-200 ${isOpen ? "rotate-90" : ""} text-[#B8860B]`
                     }),
+                    React.createElement(MarkIcons, {
+                      record: c,
+                      onOpen: (kind, record) => setMarkModal({ kind, record })
+                    }),
                     String(c.no).padStart(3, "0")
                   )
                 ),
@@ -2424,14 +3071,6 @@ function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSel
                     : "—"
                 ),
                 !compact && React.createElement("td", { className: "py-2.5 pr-3" }, c.operator || "—"),
-                React.createElement("td", {
-                  className: "py-2.5 pr-3 max-w-[180px] truncate",
-                  title: c.category
-                }, c.category || "—"),
-                React.createElement("td", {
-                  className: "py-2.5 pr-3 max-w-[220px] truncate text-[#6B6A5C]",
-                  title: c.problem
-                }, c.problem || "—"),
                 React.createElement("td", { className: "py-2.5 pr-3" },
                   React.createElement(AuditResultBadge, { value: c.auditResult, valueId: c.auditResultId, size: "sm" })
                 ),
@@ -2477,6 +3116,10 @@ function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSel
                         React.createElement(CaseDetailRow, { label: "მოთხოვნის კატეგორია", value: c.category }),
                         React.createElement(CaseDetailRow, { label: "დახმარების ტიპი", value: c.helpType }),
                         React.createElement(CaseDetailRow, { label: "შეფერხების მიზეზი", value: c.delayReason }),
+                        React.createElement(CaseDetailRow, {
+                          label: "საქმის ადრესატი",
+                          value: c.consultation || "ადრესატი მითითებული არ არის"
+                        }),
                         React.createElement(CaseDetailRow, { label: "სხვა მიზეზი", value: c.otherReason }),
                         React.createElement("div", { className: "flex flex-col gap-1" },
                           React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "სტატუსი"),
@@ -2519,7 +3162,12 @@ function CasesTable({ cases, onEdit, onDelete, compact, selectedIds, onToggleSel
         onClick: () => goPage(currentPage + 1),
         className: "px-4 py-2 text-sm font-semibold rounded-md border border-[#DBD7C8] hover:bg-[#EFEDE2] disabled:opacity-40"
       }, "შემდეგი →")
-    )
+    ),
+    markModal && React.createElement(MarkNoteModal, {
+      kind: markModal.kind,
+      record: markModal.record,
+      onClose: () => setMarkModal(null)
+    })
   );
 }
 /* ================================================================== */
@@ -2536,8 +3184,12 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
         departmentId: initial.departmentId || "",
         helpTypeId: initial.helpTypeId || "",
         delayReasonId: initial.delayReasonId || "",
+        consultationIds: Array.isArray(initial.consultationIds)
+          ? initial.consultationIds
+          : (initial.consultationId ? [initial.consultationId] : []),
         auditResultId: initial.auditResultId || "",
-        operatorId: initial.operatorId || ""
+        operatorId: initial.operatorId || "",
+        ...normalizeMarks(initial)
       };
     }
     return {
@@ -2549,11 +3201,16 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
       categoryId: getDefaultId(lists.categories),
       helpTypeId: getDefaultId(lists.helpTypes),
       delayReasonId: getDefaultId(lists.delayReasons),
+      consultationIds: [],
       otherReason: "",
       problem: "",
       recommendation: "",
       statusId: getDefaultId(lists.statuses),
-      auditResultId: getDefaultId(lists.auditResults)
+      auditResultId: getDefaultId(lists.auditResults),
+      personalStar: false,
+      personalStarNote: "",
+      critical: false,
+      criticalNote: ""
     };
   });
 
@@ -2562,13 +3219,18 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
 
   const buildPayload = () => {
     const operator = (employees.find(e => e.id === form.operatorId) || {}).name || "";
+    const marks = normalizeMarks(form);
+    const consultationIds = Array.isArray(form.consultationIds) ? form.consultationIds.filter(Boolean) : [];
     return {
       ...form,
+      ...marks,
       operatorId: form.operatorId || "",
       departmentId: form.departmentId || "",
       categoryId: form.categoryId || "",
       helpTypeId: form.helpTypeId || "",
       delayReasonId: form.delayReasonId || "",
+      consultationIds,
+      consultationId: consultationIds[0] || "",
       statusId: form.statusId || "",
       auditResultId: form.auditResultId || "",
       operator,
@@ -2576,6 +3238,7 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
       category: labelOf(lists.categories, form.categoryId),
       helpType: labelOf(lists.helpTypes, form.helpTypeId),
       delayReason: labelOf(lists.delayReasons, form.delayReasonId),
+      consultation: labelsOfIds(lists.consultations, consultationIds),
       status: labelOf(lists.statuses, form.statusId),
       auditResult: labelOf(lists.auditResults, form.auditResultId)
     };
@@ -2613,54 +3276,52 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
         })
       ),
       React.createElement(Field, { label: "ოპერატორის სახელი, გვარი" },
-        React.createElement("select", {
-          className: inputCls,
+        React.createElement(SearchableSelect, {
+          options: employees.map(e => ({ value: e.id, label: e.name })),
           value: form.operatorId || "",
-          onChange: set("operatorId")
-        },
-          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-          employees.map(e => React.createElement("option", { key: e.id, value: e.id }, e.name))
-        )
+          onChange: v => setForm({ ...form, operatorId: v }),
+          placeholder: "— აირჩიე —"
+        })
       ),
       React.createElement(Field, { label: "დეპარტამენტი" },
-        React.createElement("select", {
-          className: inputCls,
+        React.createElement(SearchableSelect, {
+          options: lists.departments.map(d => ({ value: d.id, label: d.label })),
           value: form.departmentId || "",
-          onChange: set("departmentId")
-        },
-          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-          lists.departments.map(d => React.createElement("option", { key: d.id, value: d.id }, d.label))
-        )
+          onChange: v => setForm({ ...form, departmentId: v }),
+          placeholder: "— აირჩიე —"
+        })
       ),
       React.createElement(Field, { label: "მოთხოვნის კატეგორია *" },
-        React.createElement("select", {
-          className: inputCls,
+        React.createElement(SearchableSelect, {
+          options: lists.categories.map(c => ({ value: c.id, label: c.label })),
           value: form.categoryId || "",
-          onChange: set("categoryId")
-        },
-          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-          lists.categories.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
-        )
+          onChange: v => setForm({ ...form, categoryId: v }),
+          placeholder: "— აირჩიე —"
+        })
       ),
       React.createElement(Field, { label: "დახმარების ტიპი" },
-        React.createElement("select", {
-          className: inputCls,
+        React.createElement(SearchableSelect, {
+          options: lists.helpTypes.map(c => ({ value: c.id, label: c.label })),
           value: form.helpTypeId || "",
-          onChange: set("helpTypeId")
-        },
-          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-          lists.helpTypes.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
-        )
+          onChange: v => setForm({ ...form, helpTypeId: v }),
+          placeholder: "— აირჩიე —"
+        })
       ),
       React.createElement(Field, { label: "შეფერხების მიზეზი" },
-        React.createElement("select", {
-          className: inputCls,
+        React.createElement(SearchableSelect, {
+          options: lists.delayReasons.map(c => ({ value: c.id, label: c.label })),
           value: form.delayReasonId || "",
-          onChange: set("delayReasonId")
-        },
-          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-          lists.delayReasons.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
-        )
+          onChange: v => setForm({ ...form, delayReasonId: v }),
+          placeholder: "— აირჩიე —"
+        })
+      ),
+      React.createElement(Field, { label: "საქმის ადრესატი" },
+        React.createElement(MultiSearchableSelect, {
+          options: (lists.consultations || []).map(c => ({ value: c.id, label: c.label })),
+          value: form.consultationIds || [],
+          onChange: v => setForm({ ...form, consultationIds: v }),
+          placeholder: "— აირჩიე ერთი ან რამდენიმე —"
+        })
       ),
       React.createElement(Field, { label: "სხვა მიზეზი" },
         React.createElement("input", {
@@ -2670,24 +3331,20 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
         })
       ),
       React.createElement(Field, { label: "სტატუსი *" },
-        React.createElement("select", {
-          className: inputCls,
+        React.createElement(SearchableSelect, {
+          options: lists.statuses.map(c => ({ value: c.id, label: c.label })),
           value: form.statusId || "",
-          onChange: set("statusId")
-        },
-          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-          lists.statuses.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
-        )
+          onChange: v => setForm({ ...form, statusId: v }),
+          placeholder: "— აირჩიე —"
+        })
       ),
       React.createElement(Field, { label: "აუდიტის შედეგი *" },
-        React.createElement("select", {
-          className: inputCls,
+        React.createElement(SearchableSelect, {
+          options: lists.auditResults.map(r => ({ value: r.id, label: r.label })),
           value: form.auditResultId || "",
-          onChange: set("auditResultId")
-        },
-          React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-          lists.auditResults.map(r => React.createElement("option", { key: r.id, value: r.id }, r.label))
-        )
+          onChange: v => setForm({ ...form, auditResultId: v }),
+          placeholder: "— აირჩიე —"
+        })
       ),
       React.createElement("div", { className: "col-span-2" },
         React.createElement(Field, { label: "გამოვლენილი პრობლემა" },
@@ -2708,7 +3365,8 @@ function CaseFormModal({ initial, lists, employees, onSave, onClose }) {
             onChange: set("recommendation")
           })
         )
-      )
+      ),
+      React.createElement(MarkFieldsEditor, { form, setForm })
     ),
     React.createElement("div", { className: "flex justify-end gap-2 mt-6" },
       React.createElement("button", {
@@ -2802,6 +3460,7 @@ function DashboardPage({ cases }) {
   const categoryRows = tally(filtered, "category");
   const helpRows = tally(filtered, "helpType");
   const delayRows = tally(filtered, "delayReason");
+  const consultRows = tallyConsultationMulti(filtered, null, "ადრესატი მითითებული არ არის");
   
   return React.createElement("div", { className: "flex flex-col gap-6" },
     React.createElement("div", null,
@@ -2817,10 +3476,15 @@ function DashboardPage({ cases }) {
       React.createElement(StatCard, { label: "ღია", value: open, accent: "#C0392B" })
     ),
     React.createElement(StatusDonut, { rows: statusRows, total }),
-    React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-4" },
+    React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4" },
       React.createElement(TallyPanel, { title: "მოთხოვნის კატეგორია", rows: categoryRows, total }),
       React.createElement(TallyPanel, { title: "დახმარების ტიპი", rows: helpRows, total }),
-      React.createElement(TallyPanel, { title: "შეფერხების მიზეზი", rows: delayRows, total })
+      React.createElement(TallyPanel, { title: "შეფერხების მიზეზი", rows: delayRows, total }),
+      React.createElement(TallyPanel, {
+        title: "საქმის ადრესატი",
+        rows: consultRows,
+        total
+      })
     ),
     React.createElement("div", { className: "bg-white rounded-lg border border-[#E4E1D6] p-5" },
       React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E] mb-3" }, "ფილტრირებული ჩანაწერები"),
@@ -2838,6 +3502,8 @@ function CasesPage({ data, saveData }) {
   const [statusFilter, setStatusFilter] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("");
   const [resultFilter, setResultFilter] = useState("");
+  const [consultationFilter, setConsultationFilter] = useState("");
+  const [markFilter, setMarkFilter] = useState("");
   const [timeFilters, setTimeFilters] = useState({
     date: "",
     week: "",
@@ -2871,14 +3537,16 @@ function CasesPage({ data, saveData }) {
         c.problem,
         c.recommendation,
         c.department,
-        c.delayReason
+        c.delayReason,
+        c.consultation,
+        c.criticalNote
       ].filter(Boolean).join(' ').toLowerCase()
     }));
   }, [data.cases]);
 
   useEffect(() => {
     setSelectedIds([]);
-  }, [query, statusFilter, categoryFilter, resultFilter, timeFilters.date, timeFilters.week, timeFilters.month, timeFilters.quarter, timeFilters.year]);
+  }, [query, statusFilter, categoryFilter, resultFilter, consultationFilter, markFilter, timeFilters.date, timeFilters.week, timeFilters.month, timeFilters.quarter, timeFilters.year]);
   
   const filtered = useMemo(() => {
     let result = applyFilters(data.cases, timeFilters);
@@ -2895,6 +3563,17 @@ function CasesPage({ data, saveData }) {
       result = result.filter(c => c.auditResultId === resultFilter || c.auditResult === resultFilter);
     }
 
+    if (consultationFilter) {
+      result = result.filter(c => {
+        const ids = Array.isArray(c.consultationIds) ? c.consultationIds : (c.consultationId ? [c.consultationId] : []);
+        return ids.includes(consultationFilter) || c.consultation === consultationFilter;
+      });
+    }
+
+    if (markFilter) {
+      result = result.filter(c => markFilterMatch(c, markFilter));
+    }
+
     if (query) {
       const q = query.toLowerCase();
       const matchingIds = new Set(
@@ -2906,10 +3585,10 @@ function CasesPage({ data, saveData }) {
     }
     
     return result.slice().reverse();
-  }, [data.cases, query, statusFilter, categoryFilter, resultFilter, timeFilters, searchIndex]);
+  }, [data.cases, query, statusFilter, categoryFilter, resultFilter, consultationFilter, markFilter, timeFilters, searchIndex]);
   
   const filtersActive = Boolean(
-    statusFilter || categoryFilter || resultFilter ||
+    statusFilter || categoryFilter || resultFilter || consultationFilter || markFilter ||
     timeFilters.date || timeFilters.week || timeFilters.month ||
     timeFilters.quarter || timeFilters.year
   );
@@ -2963,6 +3642,12 @@ function CasesPage({ data, saveData }) {
     const statusRows = tally(all, "status");
     const helpRows = tally(all, "helpType");
     const delayRows = tally(all, "delayReason");
+    const consultRows = tally(all, "consultation");
+    const criticalCasesN = all.filter(c => c.critical).length;
+    const criticalCaseRows = [
+      ["დამატებითი ჩანაწერით", criticalCasesN],
+      ["დამატებითი ჩანაწერის გარეშე", total - criticalCasesN]
+    ];
     
     const NAVY = "FF16213E", GREEN = "FF1F6F50", RED = "FFC0392B";
     const PAPER = "FFFBF9F3", WHITE = "FFFFFFFF", BORDERC = "FFDBD7C8", MUTED = "FF8A8672";
@@ -3155,10 +3840,13 @@ function CasesPage({ data, saveData }) {
 
     row = barSection("მოთხოვნის კატეგორია", catRows, row);
     row = barSection("დახმარების ტიპი", helpRows, row);
-    barSection("შეფერხების მიზეზი", delayRows, row);
+    row = barSection("შეფერხების მიზეზი", delayRows, row);
+    barSection("დამატებითი ჩანაწერი", criticalCaseRows, row);
 
     const cs = wb.addWorksheet("საქმეები", { views: [{ state: "frozen", ySplit: 5 }] });
 
+    const scope = data.excelConsultExportScope || "both";
+    const includeConsultCol = scope === "both" || scope === "cases";
     const headerDefs = [
         ["№", 6],
         ["აუდიტის თარიღი", 15],
@@ -3169,15 +3857,19 @@ function CasesPage({ data, saveData }) {
         ["კატეგორია", 40],
         ["დახმარების ტიპი", 21],  
         ["შეფერხების მიზეზი", 40],
+        ["კომენტარი", 40],
         ["სხვა მიზეზი", 53],
         ["პრობლემა", 53],
         ["რეკომენდაცია", 53],
         ["სტატუსი", 19],       
-        ["აუდიტის შედეგი", 19]   
+        ["აუდიტის შედეგი", 19]
     ];
+    if (includeConsultCol) {
+      headerDefs.splice(9, 0, ["საქმის ადრესატი", 40]);
+    }
   
-    const centeredCols = new Set([1, 2, 3, 4, 8, 13, 14]);
-    const lastColLetter = String.fromCharCode(64 + headerDefs.length);
+    const centeredCols = new Set([1, 2, 3, 4, 8, includeConsultCol ? 15 : 14, includeConsultCol ? 16 : 15]);
+    const lastColLetter = excelColLetter(headerDefs.length);
 
     cs.columns = headerDefs.map(([h, w]) => ({ key: h, width: w }));
 
@@ -3223,11 +3915,20 @@ function CasesPage({ data, saveData }) {
     headerRow.height = 26;
 
     all.forEach((c, i) => {
-        const r = cs.addRow([
+        const critNote = c.critical
+            ? ((c.criticalNote || "").trim() || "კომენტარი არ არის")
+            : "";
+        let consultVal = "";
+        if (includeConsultCol) {
+          consultVal = (c.consultation || "").trim() || "საქმის ადრესატი მითითებული არ არის";
+        }
+        const rowVals = [
             c.no, c.auditDate, c.incidentDate, c.jira || "", c.operator,
-            c.department, c.category, c.helpType, c.delayReason, c.otherReason,
-            c.problem, c.recommendation, c.status, c.auditResult
-        ]);
+            c.department, c.category, c.helpType, c.delayReason
+        ];
+        if (includeConsultCol) rowVals.push(consultVal);
+        rowVals.push(critNote, c.otherReason, c.problem, c.recommendation, c.status, c.auditResult);
+        const r = cs.addRow(rowVals);
 
         if (c.jira && String(c.jira).trim()) {
             const cell = r.getCell(4);
@@ -3235,7 +3936,13 @@ function CasesPage({ data, saveData }) {
             cell.font = { color: { argb: "FF0563C1" }, underline: true };
         }
 
-        if (i % 2 === 1) {
+        const critCol = includeConsultCol ? 11 : 10;
+        if (c.critical) {
+            r.eachCell(cell => {
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF6E4E1" } };
+            });
+            r.getCell(critCol).font = { bold: true, color: { argb: RED } };
+        } else if (i % 2 === 1) {
             r.eachCell(cell => {
                 cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: PAPER } };
             });
@@ -3250,13 +3957,8 @@ function CasesPage({ data, saveData }) {
             };
         });
 
-        const longest = Math.max(
-            (c.problem || "").length,
-            (c.recommendation || "").length,
-            (c.category || "").length,
-            (c.delayReason || "").length
-        );
-        r.height = longest > 90 ? 90 : longest > 45 ? 60 : longest > 20 ? 32 : 18;
+        const caseColWidths = headerDefs.map(([, w]) => w);
+        r.height = estimateExcelRowHeight(rowVals, caseColWidths, { min: 18, max: 80, lineHeight: 13 });
     });
 
     cs.autoFilter = {
@@ -3292,9 +3994,9 @@ function CasesPage({ data, saveData }) {
   return React.createElement("div", { className: "flex flex-col gap-5" },
     React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-3" },
       React.createElement("div", null,
-        React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "შემთხვევების ჟურნალი"),
+        React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "საქმეების მართვა"),
         React.createElement("p", { className: "text-sm text-[#8A8672] mt-0.5" },
-          "ყველა ჩანაწერი ინახება ავტომატურად და დაშიფრულად."
+          "შემოსული მოთხოვნები, მიმდინარე საქმეები და შესრულებული სტატუსები."
         )
       ),
       React.createElement("div", { className: "flex gap-2 flex-wrap" },
@@ -3318,43 +4020,72 @@ function CasesPage({ data, saveData }) {
         )
       )
     ),
-    React.createElement("div", { className: "flex flex-wrap gap-3 items-center bg-[#FBF9F3] border border-[#E4E1D6] rounded-lg p-3" },
-      React.createElement("div", { className: "relative flex-1 min-w-[200px]" },
-        React.createElement(Icon, {
-          name: "search",
-          size: 15,
-          className: "absolute left-2.5 top-1/2 -translate-y-1/2 text-[#9A967F]"
-        }),
-        React.createElement("input", {
-          className: "w-full pl-8 pr-3 py-1.5 rounded-md border border-[#DBD7C8] bg-white text-sm focus:outline-none focus:ring-2 focus:ring-[#B8860B]/40",
-          placeholder: "ძებნა: Jira, ოპერატორი, კატეგორია, პრობლემა…",
-          value: query,
-          onChange: e => setQuery(e.target.value)
-        })
+    React.createElement("div", { className: "flex flex-col gap-2 bg-[#FBF9F3] border border-[#E4E1D6] rounded-lg p-3" },
+      React.createElement("div", { className: "flex items-center gap-2" },
+        React.createElement("div", { className: "relative flex-1 min-w-0" },
+          React.createElement(Icon, {
+            name: "search",
+            size: 15,
+            className: "absolute left-2.5 top-1/2 -translate-y-1/2 text-[#9A967F]"
+          }),
+          React.createElement("input", {
+            className: "w-full pl-8 pr-9 py-2 rounded-md border border-[#DBD7C8] bg-white text-sm focus:outline-none focus:ring-2 focus:ring-[#B8860B]/40",
+            placeholder: "ძებნა: Jira, ოპერატორი, კატეგორია, პრობლემა…",
+            value: query,
+            onChange: e => setQuery(e.target.value)
+          }),
+          query && React.createElement("button", {
+            type: "button",
+            onClick: () => setQuery(""),
+            className: "absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded-full text-[#9A967F] hover:text-[#C0392B] hover:bg-[#F6E4E1]",
+            title: "გასუფთავება"
+          }, React.createElement(Icon, { name: "close", size: 14 }))
+        )
       ),
-      React.createElement("select", {
-        className: selectCls,
-        value: statusFilter,
-        onChange: e => setStatusFilter(e.target.value)
-      },
-        React.createElement("option", { value: "" }, "ყველა სტატუსი"),
-        data.statuses.map(s => React.createElement("option", { key: s.id, value: s.id }, s.label))
-      ),
-      React.createElement("select", {
-        className: selectCls,
-        value: categoryFilter,
-        onChange: e => setCategoryFilter(e.target.value)
-      },
-        React.createElement("option", { value: "" }, "ყველა კატეგორია"),
-        data.categories.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
-      ),
-      React.createElement("select", {
-        className: selectCls,
-        value: resultFilter,
-        onChange: e => setResultFilter(e.target.value)
-      },
-        React.createElement("option", { value: "" }, "ყველა შედეგი"),
-        data.auditResults.map(r => React.createElement("option", { key: r.id, value: r.id }, r.label))
+      React.createElement("div", { className: "flex flex-wrap gap-2 items-center" },
+        React.createElement("select", {
+          className: selectCls,
+          value: statusFilter,
+          onChange: e => setStatusFilter(e.target.value)
+        },
+          React.createElement("option", { value: "" }, "ყველა სტატუსი"),
+          data.statuses.map(s => React.createElement("option", { key: s.id, value: s.id }, s.label))
+        ),
+        React.createElement("select", {
+          className: selectCls,
+          value: categoryFilter,
+          onChange: e => setCategoryFilter(e.target.value)
+        },
+          React.createElement("option", { value: "" }, "ყველა კატეგორია"),
+          data.categories.map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
+        ),
+        React.createElement("select", {
+          className: selectCls,
+          value: resultFilter,
+          onChange: e => setResultFilter(e.target.value)
+        },
+          React.createElement("option", { value: "" }, "ყველა შედეგი"),
+          data.auditResults.map(r => React.createElement("option", { key: r.id, value: r.id }, r.label))
+        ),
+        React.createElement("select", {
+          className: selectCls,
+          value: consultationFilter,
+          onChange: e => setConsultationFilter(e.target.value)
+        },
+          React.createElement("option", { value: "" }, "ყველა ადრესატი"),
+          (data.consultations || []).map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
+        ),
+        React.createElement("select", {
+          className: selectCls,
+          value: markFilter,
+          onChange: e => setMarkFilter(e.target.value)
+        },
+          React.createElement("option", { value: "" }, "ყველა"),
+          React.createElement("option", { value: "personal" }, "⭐ პირადი"),
+          React.createElement("option", { value: "critical" }, "🔴 საჯარო"),
+          React.createElement("option", { value: "both" }, "⭐ + 🔴 ორივე"),
+          React.createElement("option", { value: "none" }, "მონიშვნის გარეშე")
+        )
       )
     ),
     React.createElement(FilterBar, { filters: timeFilters, setFilters: setTimeFilters, years }),
@@ -3389,7 +4120,7 @@ function CasesPage({ data, saveData }) {
       onCancel: () => setToDelete(null)
     }),
     bulkDeletePending && React.createElement(ConfirmDialog, {
-      text: `ნამდვილად გსურთ ${selectedIds.length} მონიშნული ჩანაწერის წაშლა?`,
+      text: `ნამდვილად გსურთ ${selectedIds.length} მონიშნული ჩანაწერის წაშლა? `,
       onConfirm: confirmBulkDelete,
       onCancel: () => setBulkDeletePending(false)
     })
@@ -3400,34 +4131,103 @@ function CasesPage({ data, saveData }) {
 /*  INCIDENTS (შემთხვევები) form modal                          */
 /* ================================================================== */
 
-function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose }) {
+function IncidentFormModal({ initial, incidentTypes, employees, consultations, statuses, taskPrefs, onTaskPrefsChange, onSave, onClose }) {
+  const consultList = consultations || [];
+  const statusList = statuses || [];
+  const prefs = taskPrefs || { taskFieldEnabled: false, showOnPanel: false, taskExportExcel: false };
+
   const [form, setForm] = useState(() => {
     if (initial) {
       return {
         ...initial,
         incidentTypeId: initial.incidentTypeId || "",
-        employeeId: initial.employeeId || ""
+        employeeId: initial.employeeId || "",
+        statusId: initial.statusId || "",
+        consultationIds: Array.isArray(initial.consultationIds)
+          ? initial.consultationIds
+          : (initial.consultationId ? [initial.consultationId] : []),
+        task: initial.task || "",
+        taskFieldEnabled: initial.taskFieldEnabled === true,
+        showOnPanel: initial.showOnPanel === true,
+        taskExportExcel: initial.taskExportExcel === true,
+        auditDate: initial.auditDate || "",
+        incidentDate: initial.incidentDate || "",
+        ...normalizeMarks(initial)
       };
     }
+
     return {
+      auditDate: new Date().toISOString().slice(0, 10),
+      incidentDate: new Date().toISOString().slice(0, 10),
       jira: "",
       employeeId: "",
       incidentTypeId: getDefaultId(incidentTypes),
-      protocolCompliant: false,
+      statusId: getDefaultId(statusList),
+      consultationIds: [],
+      task: "",
+      taskFieldEnabled: prefs.taskFieldEnabled === true,
+      showOnPanel: prefs.showOnPanel === true,
+      taskExportExcel: prefs.taskExportExcel === true,
       incomingRequest: "",
-      response: ""
+      response: "",
+      personalStar: false,
+      personalStarNote: "",
+      critical: false,
+      criticalNote: ""
     };
   });
 
   const set = k => e => setForm({ ...form, [k]: e.target.value });
+  const valid = !!form.incidentTypeId && !!form.incidentDate;
 
-  const buildPayload = () => ({
-    ...form,
-    incidentTypeId: form.incidentTypeId || "",
-    employeeId: form.employeeId || "",
-    incidentType: labelOf(incidentTypes, form.incidentTypeId),
-    employee: (employees.find(e => e.id === form.employeeId) || {}).name || ""
-  });
+  const applyTaskSwitch = (patch) => {
+    setForm(prev => {
+      const next = { ...prev, ...patch };
+      if (typeof onTaskPrefsChange === "function") {
+        onTaskPrefsChange({
+          taskFieldEnabled: next.taskFieldEnabled === true,
+          showOnPanel: next.showOnPanel === true,
+          taskExportExcel: next.taskExportExcel === true
+        });
+      }
+      return next;
+    });
+  };
+
+  const buildPayload = () => {
+    const consultationIds = Array.isArray(form.consultationIds) ? form.consultationIds.filter(Boolean) : [];
+    return {
+      ...form,
+      ...normalizeMarks(form),
+      auditDate: form.auditDate || "",
+      incidentDate: form.incidentDate || "",
+      incidentTypeId: form.incidentTypeId || "",
+      employeeId: form.employeeId || "",
+      statusId: form.statusId || "",
+      consultationIds,
+      consultationId: consultationIds[0] || "",
+      task: (form.task || "").trim(),
+      taskFieldEnabled: form.taskFieldEnabled === true,
+      showOnPanel: form.showOnPanel === true,
+      taskExportExcel: form.taskExportExcel === true,
+      incidentType: labelOf(incidentTypes, form.incidentTypeId),
+      consultation: labelsOfIds(consultList, consultationIds),
+      status: labelOf(statusList, form.statusId),
+      employee: (employees.find(e => e.id === form.employeeId) || {}).name || ""
+    };
+  };
+
+  const SwitchChip = ({ checked, onChange, label, icon }) => React.createElement("button", {
+    type: "button",
+    onClick: () => onChange(!checked),
+    className: "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold border transition-colors " +
+      (checked
+        ? "bg-[#16213E] text-white border-[#16213E]"
+        : "bg-white text-[#6B6A5C] border-[#DBD7C8] hover:bg-[#F3F1E7]")
+  },
+    React.createElement(Icon, { name: icon || "toggle_on", size: 14 }),
+    label
+  );
 
   return React.createElement(Modal, {
     title: initial ? "შემთხვევის რედაქტირება" : "ახალი შემთხვევის დამატება",
@@ -3435,7 +4235,46 @@ function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose 
     size: "xl",
     closeOnBackdrop: false
   },
+    React.createElement("div", {
+      className: "flex flex-wrap items-center gap-2 mb-4 pb-3 border-b border-[#EEEBDF]"
+    },
+      React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold mr-1" }, "TASK"),
+      React.createElement(SwitchChip, {
+        checked: form.taskFieldEnabled === true,
+        onChange: v => applyTaskSwitch({ taskFieldEnabled: v }),
+        label: "ველის ჩართვა",
+        icon: form.taskFieldEnabled ? "check_box" : "check_box_outline_blank"
+      }),
+      React.createElement(SwitchChip, {
+        checked: form.showOnPanel === true,
+        onChange: v => applyTaskSwitch({ showOnPanel: v }),
+        label: "პანელზე დამატება",
+        icon: "dashboard"
+      }),
+      React.createElement(SwitchChip, {
+        checked: form.taskExportExcel === true,
+        onChange: v => applyTaskSwitch({ taskExportExcel: v }),
+        label: "Excel-ში ექსპორტი",
+        icon: "download"
+      })
+    ),
     React.createElement("div", { className: "grid grid-cols-2 gap-6" },
+      React.createElement(Field, { label: "აუდიტის თარიღი" },
+        React.createElement("input", {
+          type: "date",
+          className: inputCls,
+          value: form.auditDate || "",
+          onChange: set("auditDate")
+        })
+      ),
+      React.createElement(Field, { label: "ინციდენტის თარიღი *" },
+        React.createElement("input", {
+          type: "date",
+          className: inputCls,
+          value: form.incidentDate || "",
+          onChange: set("incidentDate")
+        })
+      ),
       React.createElement(Field, { label: "Jira №" },
         React.createElement("input", {
           className: inputCls,
@@ -3445,43 +4284,46 @@ function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose 
         })
       ),
       React.createElement(Field, { label: "თანამშრომელი", hint: "არასავალდებულო" },
-        React.createElement("select", {
-          className: inputCls,
+        React.createElement(SearchableSelect, {
+          options: employees.map(e => ({ value: e.id, label: e.name })),
           value: form.employeeId || "",
-          onChange: set("employeeId")
-        },
-          React.createElement("option", { value: "" }, "— აირჩიე —"),
-          employees.map(e => React.createElement("option", { key: e.id, value: e.id }, e.name))
-        )
+          onChange: v => setForm({ ...form, employeeId: v }),
+          placeholder: "— აირჩიე —"
+        })
       ),
-      React.createElement("div", { className: "col-span-2" },
-        React.createElement(Field, { label: "შემთხვევა *" },
-          React.createElement("select", {
+      React.createElement(Field, { label: "საქმის ადრესატი" },
+        React.createElement(MultiSearchableSelect, {
+          options: consultList.map(c => ({ value: c.id, label: c.label })),
+          value: form.consultationIds || [],
+          onChange: v => setForm({ ...form, consultationIds: v }),
+          placeholder: "— აირჩიე ერთი ან რამდენიმე —"
+        })
+      ),
+      React.createElement(Field, { label: "შემთხვევა *" },
+        React.createElement(SearchableSelect, {
+          options: incidentTypes.map(t => ({ value: t.id, label: t.label })),
+          value: form.incidentTypeId || "",
+          onChange: v => setForm({ ...form, incidentTypeId: v }),
+          placeholder: "— აირჩიე —"
+        })
+      ),
+      React.createElement(Field, { label: "სტატუსი" },
+        React.createElement(SearchableSelect, {
+          options: statusList.map(c => ({ value: c.id, label: c.label })),
+          value: form.statusId || "",
+          onChange: v => setForm({ ...form, statusId: v }),
+          placeholder: "— აირჩიე —"
+        })
+      ),
+      form.taskFieldEnabled === true && React.createElement("div", { className: "col-span-2" },
+        React.createElement(Field, { label: "Task (დავალება)" },
+          React.createElement("textarea", {
+            rows: 2,
             className: inputCls,
-            value: form.incidentTypeId || "",
-            onChange: set("incidentTypeId")
-          },
-            React.createElement("option", { value: "" }, "—"),
-            incidentTypes.map(t => React.createElement("option", { key: t.id, value: t.id }, t.label))
-          )
-        )
-      ),
-      React.createElement("div", { className: "col-span-2" },
-        React.createElement("button", {
-          type: "button",
-          onClick: () => setForm({ ...form, protocolCompliant: !form.protocolCompliant }),
-          className: "w-full flex items-center gap-3 px-4 py-3 rounded-md border border-[#EADFB8] bg-[#FBF6E7] hover:bg-[#EFEDE2] transition-colors"
-        },
-          React.createElement(Icon, {
-            name: "star",
-            size: 30,
-            filled: form.protocolCompliant,
-            className: "transition-colors duration-200",
-            style: { color: form.protocolCompliant ? "#FFC107" : "#3A3A32" }
-          }),
-          React.createElement("span", { className: "text-sm font-semibold", style: { color: form.protocolCompliant ? "#FFC107" : "#3A3A32" } },
-            form.protocolCompliant ? "მოხსნა" : "მინიჭება"
-          )
+            placeholder: "დავალების მოკლე აღწერა…",
+            value: form.task || "",
+            onChange: set("task")
+          })
         )
       ),
       React.createElement("div", { className: "col-span-2" },
@@ -3503,7 +4345,8 @@ function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose 
             onChange: set("response")
           })
         )
-      )
+      ),
+      React.createElement(MarkFieldsEditor, { form, setForm })
     ),
     React.createElement("div", { className: "flex justify-end gap-2 mt-6" },
       React.createElement("button", {
@@ -3511,8 +4354,9 @@ function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose 
         className: "px-4 py-2 rounded-md text-sm font-semibold text-[#6B6A5C] hover:bg-[#EFEDE2]"
       }, "გაუქმება"),
       React.createElement("button", {
-        onClick: () => onSave(buildPayload()),
-        className: "px-4 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057] flex items-center gap-1.5"
+        disabled: !valid,
+        onClick: () => valid && onSave(buildPayload()),
+        className: "px-4 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057] disabled:opacity-40 flex items-center gap-1.5"
       },
         React.createElement(Icon, { name: "check", size: 15 }),
         " შენახვა"
@@ -3526,6 +4370,7 @@ function IncidentFormModal({ initial, incidentTypes, employees, onSave, onClose 
 /* ================================================================== */
 
 function IncidentsTable({ incidents, onEdit, onDelete, onPrint, selectedIds, onToggleSelect, onToggleSelectAll, onPageChange, onBulkDelete }) {
+  const [markModal, setMarkModal] = useState(null);
   const [expanded, setExpanded] = useState(null);
   const [currentPage, setCurrentPage] = useState(0);
   const ITEMS_PER_PAGE = 100;
@@ -3633,13 +4478,14 @@ function IncidentsTable({ incidents, onEdit, onDelete, onPrint, selectedIds, onT
             size: 15,
             className: `transition-transform duration-200 ${isOpen ? "rotate-90" : ""} text-[#B8860B] shrink-0`
           }),
-          React.createElement(Icon, {
-            name: "star",
-            size: 18,
-            filled: inc.protocolCompliant,
-            className: "shrink-0",
-            style: { color: inc.protocolCompliant ? "#FFC107" : "#D8D4C4" }
+          React.createElement(MarkIcons, {
+            record: inc,
+            onOpen: (kind, record) => setMarkModal({ kind, record })
           }),
+          React.createElement("span", {
+            className: "text-xs text-[#8A8672] shrink-0 whitespace-nowrap min-w-[72px]",
+            title: "ინციდენტის თარიღი"
+          }, formatDate(inc.incidentDate)),
           React.createElement("span", { className: "qa-mono text-sm text-[#2A4270] font-semibold shrink-0 min-w-[90px]" },
             inc.jira
               ? React.createElement("a", {
@@ -3654,6 +4500,12 @@ function IncidentsTable({ incidents, onEdit, onDelete, onPrint, selectedIds, onT
           React.createElement("span", { className: "text-sm text-[#3A3A32] flex-1 min-w-0 truncate" },
             inc.employee || "თანამშრომელი არ არის მითითებული"
           ),
+          (inc.showOnPanel === true && (inc.task || "").trim())
+            ? React.createElement("span", {
+                className: "text-xs text-[#3A3A32] max-w-[160px] shrink-0",
+                title: inc.task || ""
+              }, isOpen ? (inc.task || "") : truncateTaskPreview(inc.task, 4))
+            : null,
           React.createElement("span", { className: "shrink-0" },
             React.createElement("span", {
               className: "qa-stamp qa-serif inline-flex items-center px-2.5 py-1 text-xs font-semibold tracking-wide",
@@ -3684,6 +4536,34 @@ function IncidentsTable({ incidents, onEdit, onDelete, onPrint, selectedIds, onT
           React.createElement("div", { className: "overflow-hidden" },
             React.createElement("div", { className: "px-4 pb-4 pt-1 grid grid-cols-1 md:grid-cols-2 gap-4 border-t border-[#EEEBDF]" },
               React.createElement("div", { className: "flex flex-col gap-1 pt-3" },
+                React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "აუდიტის თარიღი"),
+                React.createElement("p", { className: "text-sm text-[#2C2B24]" }, formatDate(inc.auditDate))
+              ),
+              React.createElement("div", { className: "flex flex-col gap-1 pt-3" },
+                React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "ინციდენტის თარიღი"),
+                React.createElement("p", { className: "text-sm text-[#2C2B24]" }, formatDate(inc.incidentDate))
+              ),
+              React.createElement("div", { className: "flex flex-col gap-1 pt-3" },
+                React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "სტატუსი"),
+                React.createElement("p", { className: "text-sm text-[#2C2B24]" },
+                  inc.status
+                    ? React.createElement(StatusBadge, { status: inc.status, statusId: inc.statusId, size: "sm" })
+                    : "—"
+                )
+              ),
+              React.createElement("div", { className: "flex flex-col gap-1 pt-3 md:col-span-2" },
+                React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "საქმის ადრესატი"),
+                React.createElement("p", { className: "text-sm text-[#2C2B24]" },
+                  inc.consultation || "ადრესატი მითითებული არ არის"
+                )
+              ),
+              (inc.showOnPanel === true && (inc.task || "").trim()) && React.createElement("div", {
+                className: "flex flex-col gap-1 pt-3 md:col-span-2"
+              },
+                React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "Task (დავალება)"),
+                React.createElement("p", { className: "text-sm text-[#2C2B24]", style: { whiteSpace: "pre-wrap" } }, inc.task)
+              ),
+              React.createElement("div", { className: "flex flex-col gap-1 pt-3" },
                 React.createElement("span", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "შემოსული მოთხოვნა"),
                 React.createElement("p", { className: "text-sm text-[#2C2B24]", style: { whiteSpace: "pre-wrap" } }, inc.incomingRequest || "—")
               ),
@@ -3697,7 +4577,12 @@ function IncidentsTable({ incidents, onEdit, onDelete, onPrint, selectedIds, onT
       );
     })
     ),
-    incidents.length > ITEMS_PER_PAGE && React.createElement(Pager, null)
+    incidents.length > ITEMS_PER_PAGE && React.createElement(Pager, null),
+    markModal && React.createElement(MarkNoteModal, {
+      kind: markModal.kind,
+      record: markModal.record,
+      onClose: () => setMarkModal(null)
+    })
   );
 }
 
@@ -3762,7 +4647,6 @@ function DocumentHeaderBanner({ data, generatedAt }) {
 
 function IncidentPrintable({ incident, generatedAt, data }) {
   if (!incident) return null;
-  const starColor = incident.protocolCompliant ? "#FFC107" : "#C4C0AE";
   return React.createElement("div", { className: "qa-print-root hidden print:block text-[#1A1A16]" },
     React.createElement(DocumentHeaderBanner, { data, generatedAt }),
     React.createElement("div", { style: { padding: "15mm" } },
@@ -3775,20 +4659,17 @@ function IncidentPrintable({ incident, generatedAt, data }) {
       React.createElement("p", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "შემთხვევა"),
       React.createElement("p", { className: "qa-serif text-lg font-bold mt-1 text-[#16213E]" }, incident.incidentType || "—")
     ),
-    React.createElement("div", { className: "grid grid-cols-3 gap-4 mb-8" },
-      React.createElement("div", { className: "col-span-2 border border-[#DBD7C8] rounded-lg p-4" },
-        React.createElement("p", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "თანამშრომელი"),
-        React.createElement("p", { className: "qa-serif text-lg font-bold mt-1 text-[#16213E]" }, incident.employee || "თანამშრომელი არ არის მითითებული")
-      ),
-      React.createElement("div", {
-        className: "border border-[#DBD7C8] rounded-lg p-4 flex items-center justify-center"
-      },
-        React.createElement(Icon, {
-          name: "star",
-          size: 44,
-          filled: incident.protocolCompliant,
-          style: { color: starColor }
-        })
+    React.createElement("div", { className: "border border-[#DBD7C8] rounded-lg p-4 mb-4" },
+      React.createElement("p", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "თანამშრომელი"),
+      React.createElement("p", { className: "qa-serif text-lg font-bold mt-1 text-[#16213E]" }, incident.employee || "თანამშრომელი არ არის მითითებული")
+    ),
+    incident.critical && React.createElement("div", {
+      className: "border rounded-lg p-4 mb-8",
+      style: { borderColor: "#C0392B", background: "#FDF5F4" }
+    },
+      React.createElement("p", { className: "text-[10px] uppercase tracking-wide font-semibold", style: { color: "#C0392B" } }, "საჯარო მონიშვნა 🔴"),
+      React.createElement("p", { className: "text-sm mt-1 text-[#3A3A32]", style: { whiteSpace: "pre-wrap" } },
+        (incident.criticalNote || "").trim() || "კომენტარი არ არის"
       )
     ),
     React.createElement("div", { className: "grid grid-cols-1 gap-6" },
@@ -3813,7 +4694,9 @@ function IncidentsPage({ data, saveData }) {
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [employeeFilter, setEmployeeFilter] = useState("");
-  const [starFilter, setStarFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [markFilter, setMarkFilter] = useState("");
+  const [consultationFilter, setConsultationFilter] = useState("");
   const [editing, setEditing] = useState(null);
   const [adding, setAdding] = useState(false);
   const [toDelete, setToDelete] = useState(null);
@@ -3825,7 +4708,7 @@ function IncidentsPage({ data, saveData }) {
 
   useEffect(() => {
     setSelectedIds([]);
-  }, [query, typeFilter, employeeFilter, starFilter]);
+  }, [query, typeFilter, employeeFilter, statusFilter, markFilter, consultationFilter]);
 
   useEffect(() => {
     if (printId) {
@@ -3842,7 +4725,7 @@ function IncidentsPage({ data, saveData }) {
   const searchIndex = useMemo(() => {
     return incidents.map(i => ({
       id: i.id,
-      searchable: [i.jira, i.employee, i.incidentType, i.incomingRequest, i.response]
+      searchable: [i.jira, i.employee, i.incidentType, i.consultation, i.incomingRequest, i.response, i.criticalNote, i.task]
         .filter(Boolean).join(' ').toLowerCase()
     }));
   }, [incidents]);
@@ -3857,8 +4740,16 @@ function IncidentsPage({ data, saveData }) {
         result = result.filter(i => i.employee === employeeFilter);
       }
     }
-    if (starFilter === "yes") result = result.filter(i => i.protocolCompliant);
-    if (starFilter === "no") result = result.filter(i => !i.protocolCompliant);
+    if (statusFilter) {
+      result = result.filter(i => i.statusId === statusFilter || i.status === statusFilter);
+    }
+    if (markFilter) result = result.filter(i => markFilterMatch(i, markFilter));
+    if (consultationFilter) {
+      result = result.filter(i => {
+        const ids = Array.isArray(i.consultationIds) ? i.consultationIds : (i.consultationId ? [i.consultationId] : []);
+        return ids.includes(consultationFilter) || i.consultation === consultationFilter;
+      });
+    }
     if (query) {
       const q = query.toLowerCase();
       const matchingIds = new Set(
@@ -3867,31 +4758,43 @@ function IncidentsPage({ data, saveData }) {
       result = result.filter(i => matchingIds.has(i.id));
     }
     return result.slice().reverse();
-  }, [incidents, typeFilter, employeeFilter, starFilter, query, searchIndex]);
+  }, [incidents, typeFilter, employeeFilter, statusFilter, markFilter, consultationFilter, query, searchIndex]);
 
-  const filtersActive = Boolean(typeFilter || employeeFilter || starFilter || query);
+  const filtersActive = Boolean(typeFilter || employeeFilter || statusFilter || markFilter || consultationFilter || query);
 
   const total = filtered.length;
-  const starredCount = filtered.filter(i => i.protocolCompliant).length;
-  const notStarredCount = total - starredCount;
+  const criticalCount = filtered.filter(i => i.critical).length;
+  const personalCount = filtered.filter(i => i.personalStar).length;
 
   const typeRows = tally(filtered, "incidentType");
+  const consultRows = tallyConsultationMulti(filtered, data.consultations, "ადრესატი მითითებული არ არის");
   const employeeRows = tally(
     filtered.map(i => ({ employeeLabel: i.employee || "თანამშრომელი არ არის მითითებული" })),
     "employeeLabel"
   );
-  const starRows = [
-    ["მინიჭებული", starredCount],
-    ["არ არის მინიჭებული", notStarredCount]
+  const criticalRows = [
+    ["საჯარო მონიშვნით", criticalCount],
+    ["მონიშვნის გარეშე", total - criticalCount]
   ];
 
   const saveIncident = form => {
+    const persisted = {
+      ...form,
+      task: (form.task || "").trim(),
+      taskFieldEnabled: form.taskFieldEnabled === true,
+      showOnPanel: form.showOnPanel === true,
+      taskExportExcel: form.taskExportExcel === true,
+      statusId: form.statusId || "",
+      status: form.status || "",
+      auditDate: form.auditDate || "",
+      incidentDate: form.incidentDate || ""
+    };
     let list;
     if (editing) {
-      list = incidents.map(i => i.id === editing.id ? { ...editing, ...form } : i);
+      list = incidents.map(i => i.id === editing.id ? { ...editing, ...persisted } : i);
     } else {
       const no = (incidents.reduce((m, i) => Math.max(m, i.no || 0), 0) || 0) + 1;
-      list = [...incidents, { id: uid(), no, createdAt: new Date().toISOString(), ...form }];
+      list = [...incidents, { id: uid(), no, createdAt: new Date().toISOString(), ...persisted }];
     }
     saveData({ ...data, incidents: list });
     setEditing(null);
@@ -3929,13 +4832,18 @@ function IncidentsPage({ data, saveData }) {
   const exportIncidentsExcel = async (list) => {
     const all = [...list].sort((a, b) => (a.no || 0) - (b.no || 0));
     const total = all.length;
-    const starred = all.filter(i => i.protocolCompliant).length;
-    const notStarred = total - starred;
+    const criticalN = all.filter(i => i.critical).length;
+    const nonCriticalN = total - criticalN;
     const typeTally = tally(all, "incidentType");
+    const consultTally = tally(all, "consultation");
     const empTally = tally(
       all.map(i => ({ employeeLabel: i.employee || "თანამშრომელი არ არის მითითებული" })),
       "employeeLabel"
     );
+    const criticalExcelRows = [
+      ["დამატებითი ჩანაწერით", criticalN],
+      ["დამატებითი ჩანაწერის გარეშე", nonCriticalN]
+    ];
 
     const { NAVY, GREEN, RED, PAPER, WHITE, BORDERC, MUTED } = EXCEL_COLORS;
 
@@ -3979,8 +4887,8 @@ function IncidentsPage({ data, saveData }) {
 
     const kpis = [
       ["სულ შემთხვევა", total, NAVY, "B"],
-      ["მინიჭებული", starred, GREEN, "E"],
-      ["არ არის მინიჭებული", notStarred, RED, "H"]
+      ["დამატებითი ჩანაწერით", criticalN, RED, "E"],
+      ["დამატებითი ჩანაწერის გარეშე", nonCriticalN, GREEN, "H"]
     ];
 
     kpis.forEach(([label, value, color, col]) => {
@@ -3997,7 +4905,7 @@ function IncidentsPage({ data, saveData }) {
     });
 
     const donutW = 430, donutH = 230;
-    const starImg = chartDrawDonut(starRows, donutW, donutH, "პროტოკოლის შესაბამისობა", ["#1F6F50", "#C0392B"]);
+    const starImg = chartDrawDonut(criticalExcelRows, donutW, donutH, "დამატებითი ჩანაწერი", ["#C0392B", "#6B7A99"]);
     dash.addImage(wb.addImage({ base64: starImg, extension: "png" }), "B9:E17");
 
     const typeImg = chartDrawDonut(typeTally, donutW, donutH, "შემთხვევების ტიპები");
@@ -4011,17 +4919,31 @@ function IncidentsPage({ data, saveData }) {
 
     const rs = wb.addWorksheet("ჩანაწერები", { views: [{ state: "frozen", ySplit: 5 }] });
 
+    const scope = data.excelConsultExportScope || "both";
+    const includeConsultCol = scope === "both" || scope === "incidents";
+    const includeTaskCol = all.some(inc => inc.taskExportExcel === true || inc.taskExportExcel === "true")
+      || (data.incidentTaskPrefs && data.incidentTaskPrefs.taskExportExcel === true);
     const headerDefs = [
       ["№", 6],
+      ["აუდიტის თარიღი", 15],
+      ["ინციდენტის თარიღი", 16],
       ["Jira", 14],
       ["თანამშრომელი", 45],
       ["შემთხვევა", 45],
-      ["პროტოკოლის შესაბამისობა", 20],
+      ["სტატუსი", 19],
+      ["კომენტარი", 40],
       ["შემოსული მოთხოვნა", 45],
       ["დაბრუნებული პასუხი", 45]
     ];
-    const centeredCols = new Set([1, 2, 5]);
-    const rsLastColLetter = String.fromCharCode(64 + headerDefs.length);
+    if (includeTaskCol) {
+      headerDefs.splice(5, 0, ["Task", 45]);
+    }
+    if (includeConsultCol) {
+      const consultAt = includeTaskCol ? 8 : 7;
+      headerDefs.splice(consultAt, 0, ["საქმის ადრესატი", 40]);
+    }
+    const centeredCols = new Set([1, 2, 3, 4, 7]);
+    const rsLastColLetter = excelColLetter(headerDefs.length);
 
     rs.columns = headerDefs.map(([h, w]) => ({ key: h, width: w }));
 
@@ -4067,26 +4989,43 @@ function IncidentsPage({ data, saveData }) {
     headerRow.height = 26;
 
     all.forEach((inc, i) => {
-      const r = rs.addRow([
+      const critNote = inc.critical
+        ? ((inc.criticalNote || "").trim() || "კომენტარი არ არის")
+        : "";
+      let consultVal = "";
+      if (includeConsultCol) {
+        consultVal = (inc.consultation || "").trim() || "საქმის ადრესატი მითითებული არ არის";
+      }
+      const rowVals = [
         inc.no,
+        inc.auditDate || "",
+        inc.incidentDate || "",
         inc.jira || "",
-        inc.employee || "თანამშრომელი არ არის მითითებული",
-        inc.incidentType || "",
-        inc.protocolCompliant ? "დიახ ★" : "არა",
-        inc.incomingRequest || "",
-        inc.response || ""
-      ]);
+        inc.employee || "თანამშრომელი არ არის მითითებული"
+      ];
+      if (includeTaskCol) {
+        const exportThis = inc.taskExportExcel === true || inc.taskExportExcel === "true"
+          || (data.incidentTaskPrefs && data.incidentTaskPrefs.taskExportExcel === true);
+        rowVals.push(exportThis ? ((inc.task || "").trim()) : "");
+      }
+      rowVals.push(inc.incidentType || "", inc.status || "");
+      if (includeConsultCol) rowVals.push(consultVal);
+      rowVals.push(critNote, inc.incomingRequest || "", inc.response || "");
+      const r = rs.addRow(rowVals);
 
       if (inc.jira && String(inc.jira).trim()) {
-        const cell = r.getCell(2);
+        const cell = r.getCell(4);
         cell.value = { text: String(inc.jira).trim(), hyperlink: jiraUrl(inc.jira) };
         cell.font = { color: { argb: "FF0563C1" }, underline: true };
       }
 
-      const starCell = r.getCell(5);
-      starCell.font = { bold: true, color: { argb: inc.protocolCompliant ? GREEN : RED } };
-
-      if (i % 2 === 1) {
+      const critCol = 7 + (includeTaskCol ? 1 : 0) + (includeConsultCol ? 1 : 0) + 1;
+      if (inc.critical) {
+        r.eachCell(cell => {
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF6E4E1" } };
+        });
+        r.getCell(critCol).font = { bold: true, color: { argb: RED } };
+      } else if (i % 2 === 1) {
         r.eachCell(cell => {
           if (!cell.font || !cell.font.color) {
             cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: PAPER } };
@@ -4103,8 +5042,8 @@ function IncidentsPage({ data, saveData }) {
         };
       });
 
-      const longest = Math.max((inc.incomingRequest || "").length, (inc.response || "").length);
-      r.height = longest > 200 ? 120 : longest > 90 ? 70 : longest > 30 ? 34 : 18;
+      const incColWidths = headerDefs.map(([, w]) => w);
+      r.height = estimateExcelRowHeight(rowVals, incColWidths, { min: 18, max: 80, lineHeight: 13 });
     });
 
     rs.autoFilter = {
@@ -4142,9 +5081,9 @@ function IncidentsPage({ data, saveData }) {
     React.createElement("div", { className: "qa-noprint flex flex-col gap-6" },
       React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-3" },
         React.createElement("div", null,
-          React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "შემთხვევები"),
+          React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "შემთხვევების მართვა"),
           React.createElement("p", { className: "text-sm text-[#8A8672] mt-0.5" },
-            "შემოსული მოთხოვნები, დაბრუნებული პასუხები და პროტოკოლის შესაბამისობა."
+            "შემოსული მოთხოვნები, დაბრუნებული პასუხები და მონიშვნები."
           )
         ),
         React.createElement("div", { className: "flex gap-2 flex-wrap" },
@@ -4169,58 +5108,91 @@ function IncidentsPage({ data, saveData }) {
         )
       ),
 
-      React.createElement("div", { className: "flex flex-wrap gap-3 items-center bg-[#FBF9F3] border border-[#E4E1D6] rounded-lg p-3" },
-        React.createElement("div", { className: "relative flex-1 min-w-[200px]" },
-          React.createElement(Icon, {
-            name: "search",
-            size: 15,
-            className: "absolute left-2.5 top-1/2 -translate-y-1/2 text-[#9A967F]"
-          }),
-          React.createElement("input", {
-            className: "w-full pl-8 pr-3 py-1.5 rounded-md border border-[#DBD7C8] bg-white text-sm focus:outline-none focus:ring-2 focus:ring-[#B8860B]/40",
-            placeholder: "ძებნა: Jira, თანამშრომელი, მოთხოვნა, პასუხი…",
-            value: query,
-            onChange: e => setQuery(e.target.value)
-          })
+      React.createElement("div", { className: "flex flex-col gap-2 bg-[#FBF9F3] border border-[#E4E1D6] rounded-lg p-3" },
+        React.createElement("div", { className: "flex items-center gap-2" },
+          React.createElement("div", { className: "relative flex-1 min-w-0" },
+            React.createElement(Icon, {
+              name: "search",
+              size: 15,
+              className: "absolute left-2.5 top-1/2 -translate-y-1/2 text-[#9A967F]"
+            }),
+            React.createElement("input", {
+              className: "w-full pl-8 pr-9 py-2 rounded-md border border-[#DBD7C8] bg-white text-sm focus:outline-none focus:ring-2 focus:ring-[#B8860B]/40",
+              placeholder: "ძებნა: Jira, თანამშრომელი, მოთხოვნა, პასუხი, Task…",
+              value: query,
+              onChange: e => setQuery(e.target.value)
+            }),
+            query && React.createElement("button", {
+              type: "button",
+              onClick: () => setQuery(""),
+              className: "absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded-full text-[#9A967F] hover:text-[#C0392B] hover:bg-[#F6E4E1]",
+              title: "გასუფთავება"
+            }, React.createElement(Icon, { name: "close", size: 14 }))
+          )
         ),
-        React.createElement("select", {
-          className: selectCls,
-          value: typeFilter,
-          onChange: e => setTypeFilter(e.target.value)
-        },
-          React.createElement("option", { value: "" }, "ყველა შემთხვევა"),
-          data.incidentTypes.map(t => React.createElement("option", { key: t.id, value: t.id }, t.label))
-        ),
-        React.createElement("select", {
-          className: selectCls,
-          value: employeeFilter,
-          onChange: e => setEmployeeFilter(e.target.value)
-        },
-          React.createElement("option", { value: "" }, "ყველა თანამშრომელი"),
-          React.createElement("option", { value: "__none__" }, "თანამშრომელი არ არის მითითებული"),
-          data.employees.map(e => React.createElement("option", { key: e.id, value: e.name }, e.name))
-        ),
-        React.createElement("select", {
-          className: selectCls,
-          value: starFilter,
-          onChange: e => setStarFilter(e.target.value)
-        },
-          React.createElement("option", { value: "" }, "⭐ ყველა"),
-          React.createElement("option", { value: "yes" }, "⭐ მინიჭებული"),
-          React.createElement("option", { value: "no" }, "არ არის მინიჭებული")
+        React.createElement("div", { className: "flex flex-wrap gap-2 items-center" },
+          React.createElement("select", {
+            className: selectCls,
+            value: typeFilter,
+            onChange: e => setTypeFilter(e.target.value)
+          },
+            React.createElement("option", { value: "" }, "ყველა შემთხვევა"),
+            data.incidentTypes.map(t => React.createElement("option", { key: t.id, value: t.id }, t.label))
+          ),
+          React.createElement("select", {
+            className: selectCls,
+            value: employeeFilter,
+            onChange: e => setEmployeeFilter(e.target.value)
+          },
+            React.createElement("option", { value: "" }, "ყველა თანამშრომელი"),
+            React.createElement("option", { value: "__none__" }, "თანამშრომელი არ არის მითითებული"),
+            data.employees.map(e => React.createElement("option", { key: e.id, value: e.name }, e.name))
+          ),
+          React.createElement("select", {
+            className: selectCls,
+            value: statusFilter,
+            onChange: e => setStatusFilter(e.target.value)
+          },
+            React.createElement("option", { value: "" }, "ყველა სტატუსი"),
+            (data.statuses || []).map(s => React.createElement("option", { key: s.id, value: s.id }, s.label))
+          ),
+          React.createElement("select", {
+            className: selectCls,
+            value: markFilter,
+            onChange: e => setMarkFilter(e.target.value)
+          },
+            React.createElement("option", { value: "" }, "ყველა"),
+            React.createElement("option", { value: "personal" }, "⭐ პირადი"),
+            React.createElement("option", { value: "critical" }, "🔴 საჯარო"),
+            React.createElement("option", { value: "both" }, "⭐ + 🔴 ორივე"),
+            React.createElement("option", { value: "none" }, "მონიშვნის გარეშე")
+          ),
+          React.createElement("select", {
+            className: selectCls,
+            value: consultationFilter,
+            onChange: e => setConsultationFilter(e.target.value)
+          },
+            React.createElement("option", { value: "" }, "ყველა ადრესატი"),
+            (data.consultations || []).map(c => React.createElement("option", { key: c.id, value: c.id }, c.label))
+          )
         )
       ),
 
       React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-4" },
         React.createElement(StatCard, { label: "სულ შემთხვევა", value: total }),
-        React.createElement(StatCard, { label: "მინიჭებული", value: starredCount, accent: "#1F6F50" }),
-        React.createElement(StatCard, { label: "არ არის მინიჭებული", value: notStarredCount, accent: "#C0392B" })
+        React.createElement(StatCard, { label: "საჯარო 🔴", value: criticalCount, accent: "#C0392B" }),
+        React.createElement(StatCard, { label: "პირადი ⭐", value: personalCount, accent: "#B8860B" })
       ),
 
-      React.createElement(GenericDonut, { rows: starRows, total, colors: ["#1F6F50", "#C0392B"] }),
+      React.createElement(GenericDonut, { rows: criticalRows, total, colors: ["#C0392B", "#6B7A99"] }),
 
-      React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4" },
+      React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-4" },
         React.createElement(TallyPanel, { title: "შემთხვევების ტიპები", rows: typeRows, total }),
+        React.createElement(TallyPanel, {
+          title: "საქმის ადრესატი",
+          rows: consultRows,
+          total
+        }),
         React.createElement(TallyPanel, { title: "თანამშრომლების ჭრილი", rows: employeeRows, total })
       ),
 
@@ -4245,6 +5217,23 @@ function IncidentsPage({ data, saveData }) {
         initial: editing,
         incidentTypes: data.incidentTypes,
         employees: data.employees,
+        consultations: data.consultations,
+        statuses: data.statuses,
+        taskPrefs: data.incidentTaskPrefs || {
+          taskFieldEnabled: false,
+          showOnPanel: false,
+          taskExportExcel: false
+        },
+        onTaskPrefsChange: (prefs) => {
+          saveData({
+            ...data,
+            incidentTaskPrefs: {
+              taskFieldEnabled: prefs.taskFieldEnabled === true,
+              showOnPanel: prefs.showOnPanel === true,
+              taskExportExcel: prefs.taskExportExcel === true
+            }
+          });
+        },
         onSave: saveIncident,
         onClose: () => {
           setEditing(null);
@@ -4304,9 +5293,9 @@ function EmployeesPage({ data, saveData, goToEmployee }) {
   return React.createElement("div", { className: "flex flex-col gap-5" },
     React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-3" },
       React.createElement("div", null,
-        React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "თანამშრომლების ჟურნალი"),
+        React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "თანამშრომლები"),
         React.createElement("p", { className: "text-sm text-[#8A8672] mt-0.5" },
-          "ეს სია ავსებს ოპერატორის ჩამოსაშლელს საქმეების ფორმაში."
+          "თანამშრომლების სია, სტატისტიკა და შესრულებული სამუშაო."
         )
       ),
       React.createElement("button", {
@@ -4314,7 +5303,7 @@ function EmployeesPage({ data, saveData, goToEmployee }) {
         className: "flex items-center gap-1.5 px-3.5 py-2 rounded-md text-sm font-semibold bg-[#16213E] text-white hover:bg-[#223057]"
       },
         React.createElement(Icon, { name: "add", size: 15 }),
-        " თანამშრომელი"
+        " თანამშრომელის დამატება"
       )
     ),
     React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4" },
@@ -4465,7 +5454,7 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
     React.createElement("div", { className: "qa-noprint flex flex-col gap-6" },
       React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-3" },
         React.createElement("div", null,
-          React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "თანამშრომლის ძებნა"),
+          React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "თანამშრომლის არჩევა"),
           React.createElement("p", { className: "text-sm text-[#8A8672] mt-0.5" },
             "აირჩიეთ თანამშრომელი და, სურვილისამებრ, პერიოდი."
           )
@@ -4479,16 +5468,16 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
         )
       ),
       React.createElement("div", { className: "flex flex-wrap gap-3 items-end bg-[#FBF9F3] border border-[#E4E1D6] rounded-lg p-3" },
-        React.createElement("div", { className: "flex flex-col gap-1" },
+        React.createElement("div", { className: "flex flex-col gap-1 w-full max-w-2xl" },
           React.createElement("label", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "თანამშრომელი"),
-          React.createElement("select", {
-            className: "px-2.5 py-1.5 rounded-md border border-[#DBD7C8] bg-white text-sm min-w-[220px]",
-            value: selected,
-            onChange: e => setSelected(e.target.value)
-          },
-            React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-            data.employees.map(e => React.createElement("option", { key: e.id, value: e.name }, e.name))
-          )
+          React.createElement(SearchableSelect, {
+            options: (data.employees || []).map(e => ({ value: e.name, label: e.name })),
+            value: selected || "",
+            onChange: v => setSelected(v || ""),
+            placeholder: "— აირჩიეთ —",
+            className: "w-full min-w-[420px]",
+            allowWrap: true
+          })
         )
       ),
       !selected
@@ -4503,7 +5492,7 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
             React.createElement(StatCard, { label: "დახურული", value: closed, accent: "#1F6F50" }),
             React.createElement(StatCard, { label: "ღია", value: open, accent: "#C0392B" })
           ),
-          React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4" },
+          React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-4" },
             React.createElement(TallyPanel, {
               title: "კატეგორიების ჭრილი",
               rows: tally(filtered, "category"),
@@ -4512,6 +5501,11 @@ function EmployeeDetailPage({ data, selected, setSelected }) {
             React.createElement(TallyPanel, {
               title: "შეფერხების მიზეზები",
               rows: tally(filtered, "delayReason"),
+              total
+            }),
+            React.createElement(TallyPanel, {
+              title: "საქმის ადრესატი",
+              rows: tallyConsultationMulti(filtered, data.consultations, "ადრესატი მითითებული არ არის"),
               total
             })
           ),
@@ -4574,9 +5568,9 @@ function CategoryDetailPage({ data, selected, setSelected }) {
     React.createElement("div", { className: "qa-noprint flex flex-col gap-6" },
       React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-3" },
         React.createElement("div", null,
-          React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "მოთხოვნის კატეგორიის დეტალები"),
+          React.createElement("h1", { className: "qa-serif text-2xl font-bold text-[#16213E]" }, "კატეგორიის არჩევა"),
           React.createElement("p", { className: "text-sm text-[#8A8672] mt-0.5" },
-            "აირჩიეთ კატეგორია და, სურვილისამებრ, პერიოდი."
+            "აირჩიეთ კატეგორია დეტალური ანალიტიკის სანახავად."
           )
         ),
         selected && React.createElement("button", {
@@ -4588,16 +5582,16 @@ function CategoryDetailPage({ data, selected, setSelected }) {
         )
       ),
       React.createElement("div", { className: "flex flex-wrap gap-3 items-end bg-[#FBF9F3] border border-[#E4E1D6] rounded-lg p-3" },
-        React.createElement("div", { className: "flex flex-col gap-1" },
+        React.createElement("div", { className: "flex flex-col gap-1 w-full max-w-2xl" },
           React.createElement("label", { className: "text-[10px] uppercase tracking-wide text-[#8A8672] font-semibold" }, "კატეგორია"),
-          React.createElement("select", {
-            className: "px-2.5 py-1.5 rounded-md border border-[#DBD7C8] bg-white text-sm min-w-[260px]",
-            value: selected,
-            onChange: e => setSelected(e.target.value)
-          },
-            React.createElement("option", { value: "" }, "— აირჩიეთ —"),
-            data.categories.map(c => React.createElement("option", { key: c.id, value: c.label }, c.label))
-          )
+          React.createElement(SearchableSelect, {
+            options: (data.categories || []).map(c => ({ value: c.label, label: c.label })),
+            value: selected || "",
+            onChange: v => setSelected(v || ""),
+            placeholder: "— აირჩიეთ —",
+            className: "w-full min-w-[420px]",
+            allowWrap: true
+          })
         )
       ),
       !selected
@@ -4612,7 +5606,7 @@ function CategoryDetailPage({ data, selected, setSelected }) {
             React.createElement(StatCard, { label: "დახურული", value: closed, accent: "#1F6F50" }),
             React.createElement(StatCard, { label: "ღია", value: open, accent: "#C0392B" })
           ),
-          React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4" },
+          React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-4" },
             React.createElement(TallyPanel, {
               title: "თანამშრომლების ჭრილი ამ კატეგორიაში",
               rows: tally(filtered, "operator"),
@@ -4621,6 +5615,11 @@ function CategoryDetailPage({ data, selected, setSelected }) {
             React.createElement(TallyPanel, {
               title: "სტატუსების ჭრილი",
               rows: tally(filtered, "status"),
+              total
+            }),
+            React.createElement(TallyPanel, {
+              title: "საქმის ადრესატი",
+              rows: tallyConsultationMulti(filtered, data.consultations, "ადრესატი მითითებული არ არის"),
               total
             })
           ),
@@ -4773,7 +5772,7 @@ function SettingsPage({
   const [changePwOpen, setChangePwOpen] = useState(false);
 
   const backupAgeDays = daysSince(lastBackupAt);
-  const backupIsStale = isBackupStale(lastBackupAt);
+  const backupIsStale = shouldShowBackupReminder(lastBackupAt);
   
   const update = (key, items) => saveData({ ...data, [key]: items });
   
@@ -4782,6 +5781,7 @@ function SettingsPage({
     { key: "departments", label: "დეპარტამენტები" },
     { key: "helpTypes", label: "დახმარების ტიპები" },
     { key: "delayReasons", label: "შეფერხების მიზეზები" },
+    { key: "consultations", label: "საქმის ადრესატი" },
     { key: "statuses", label: "სტატუსები" },
     { key: "auditResults", label: "აუდიტის შედეგი" },
     { key: "incidentTypes", label: "შემთხვევების ტიპები" }
@@ -4915,7 +5915,7 @@ function SettingsPage({
           type: "success",
           title: "წარმატებული Import",
           message: "Backup წარმატებით აღდგა!",
-          details: `ჩანაწერები: ${decrypted.cases.length}\n👥 თანამშრომლები: ${decrypted.employees?.length || 0}\n თარიღი: ${parsed.timestamp ? new Date(parsed.timestamp).toLocaleString('ka-GE') : '—'}`
+          details: `ჩანაწერები: ${decrypted.cases.length}\n თარიღი: ${parsed.timestamp ? new Date(parsed.timestamp).toLocaleString('ka-GE') : '—'}`
         });
       } else {
         setAlertModal({
@@ -4959,10 +5959,12 @@ function SettingsPage({
       React.createElement(Icon, { name: "warning", size: 18, className: "text-[#B8860B] shrink-0 mt-0.5" }),
       React.createElement("div", { className: "flex-1" },
         React.createElement("p", { className: "text-sm font-semibold text-[#8C6B21]" },
-          lastBackupAt ? `ბოლო სარეზერვო ასლი ${backupAgeDays} დღის წინ გააკეთეთ` : "სარეზერვო ასლი ჯერ არასდროს გაგიკეთებიათ"
+          "დროა დღიური Backup-ისთვის"
         ),
         React.createElement("p", { className: "text-xs text-[#8C6B21] mt-0.5" },
-          "მონაცემები ინახება მხოლოდ ამ ბრაუზერში. თუ ბრაუზერის მონაცემები წაიშლება, backup-ის გარეშე აღდგენა შეუძლებელია."
+          lastBackupAt
+            ? `ბოლო სარეზერვო ასლი${backupAgeDays === 0 ? " დღეს" : ` ${backupAgeDays} დღის წინ`}. გთხოვთ, შექმნათ Backup მონაცემთა დასაცავად`
+            : "Backup გაკეთება მნიშვნელოვანია თქვენი მონაცემების დაცვისთვის."
         )
       ),
       React.createElement("button", {
@@ -5053,6 +6055,7 @@ function SettingsPage({
           departments: "departmentId",
           helpTypes: "helpTypeId",
           delayReasons: "delayReasonId",
+          consultations: "consultationId",
           statuses: "statusId",
           auditResults: "auditResultId",
           incidentTypes: "incidentTypeId"
@@ -5061,6 +6064,13 @@ function SettingsPage({
         const usageCount = (id) => {
           if (f.key === "incidentTypes") {
             return (data.incidents || []).filter(i => i.incidentTypeId === id).length;
+          }
+          if (f.key === "consultations") {
+            const has = (rec) => {
+              const ids = Array.isArray(rec.consultationIds) ? rec.consultationIds : (rec.consultationId ? [rec.consultationId] : []);
+              return ids.includes(id);
+            };
+            return (data.cases || []).filter(has).length + (data.incidents || []).filter(has).length;
           }
           return (data.cases || []).filter(c => c[idField] === id).length;
         };
@@ -5072,7 +6082,10 @@ function SettingsPage({
           onAdd: (label) => {
             const list = data[f.key] || [];
             if (list.some(x => x.label === label)) return;
-            const known = f.key === "statuses" ? KNOWN_STATUS_IDS : f.key === "auditResults" ? KNOWN_AUDIT_IDS : null;
+            const known = f.key === "statuses" ? KNOWN_STATUS_IDS
+              : f.key === "auditResults" ? KNOWN_AUDIT_IDS
+              : f.key === "consultations" ? KNOWN_CONSULTATION_IDS
+              : null;
             const id = (known && known[label]) || newRefId(f.key.slice(0, 3));
             update(f.key, [...list, { id, label, isDefault: false }]);
           },
@@ -5100,12 +6113,51 @@ function SettingsPage({
             update(f.key, (data[f.key] || []).filter(x => x.id !== id));
           },
           hint: f.key === "auditResults"
-            ? "მწვანე ნიშანი = ნაგულისხმევი ახალ საქმეზე. სახელის შეცვლა არ არღვევს სტატისტიკას."
+            ? "ნაგულისხმევი მნიშვნელობა ახალი საქმისთვის."
             : f.key === "incidentTypes"
-            ? "მწვანე ნიშანი = ნაგულისხმევი ახალ შემთხვევაზე."
-            : "მწვანე ნიშანი = ნაგულისხმევი. კვლავ დაჭერით გასაუქმებლად. მხოლოდ ერთი შეიძლება იყოს მონიშნული."
+            ? "ნაგულისხმევი მნიშვნელობა ახალი შემთხვევისთვის."
+            : "მონიშნულია როგორც ნაგულისხმევი. ხელახლა დაჭერით გაუქმება. შესაძლებელია მხოლოდ ერთის არჩევა."
         });
       })
+    ),
+
+    React.createElement("div", { className: "bg-white rounded-lg border border-[#E4E1D6] p-5" },
+      React.createElement("h3", { className: "qa-serif text-sm font-bold text-[#16213E] mb-1 flex items-center gap-2" },
+        React.createElement(Icon, { name: "table_view", size: 16, className: "text-[#B8860B]" }),
+        "Excel-ში ექსპორტის მართვა"
+      ),
+      React.createElement("p", { className: "text-xs text-[#8A8672] mb-1 mt-1" },
+        "აირჩიეთ, გადავიდეს თუ არა საქმის ადრესატის მონაცემები Excel-ში. ხელახლა დაჭერით არჩევანს გააუქმებთ."
+      ),
+      React.createElement("div", { className: "flex flex-wrap gap-2" },
+        [
+          { value: "cases", label: "მხოლოდ საქმეები", icon: "assignment" },
+          { value: "incidents", label: "მხოლოდ შემთხვევები", icon: "task_alt" },
+          { value: "both", label: "ორივე", icon: "done_all" }
+        ].map(opt => {
+          const cur = data.excelConsultExportScope || "both";
+          const active = cur === opt.value;
+          return React.createElement("button", {
+            type: "button",
+            key: opt.value,
+            onClick: () => {
+              const next = active ? "none" : opt.value;
+              saveData({ ...data, excelConsultExportScope: next });
+            },
+            className: "inline-flex items-center gap-2 px-3.5 py-2 rounded-md text-sm font-semibold border transition-colors " +
+              (active
+                ? "bg-[#16213E] text-white border-[#16213E]"
+                : "bg-[#FBF9F3] text-[#3A3A32] border-[#DBD7C8] hover:bg-[#F3F1E7]")
+          },
+            React.createElement(Icon, { name: opt.icon, size: 15 }),
+            opt.label,
+            active && React.createElement(Icon, { name: "check", size: 14 })
+          );
+        })
+      ),
+      (data.excelConsultExportScope === "none") && React.createElement("p", {
+        className: "text-xs text-[#8C6B21] mt-3 italic"
+      }, "ამჟამად არცერთი ოფცია არ არის მონიშნული, ადრესატი Excel-ში არ გაექსპორტდება.")
     ),
     
     exportModal === "password" && React.createElement(PasswordPromptModal, {
@@ -5126,7 +6178,7 @@ function SettingsPage({
     
     importModal?.type === "plain-v2" && React.createElement(ConfirmModalCustom, {
       title: "⚠️ დაუშიფრავი Backup",
-      message: "ეს არის დაუშიფრავი backup (არაუსაფრთხო ფორმატი).",
+      message: "ეს არის დაუშიფრავი backup.",
       details: "გსურთ აღდგენა?",
       icon: "warning",
       confirmStyle: "primary",
@@ -5165,7 +6217,6 @@ function SettingsPage({
           type: "success",
           title: "პაროლი შეიცვალა",
           message: "თქვენი პაროლი წარმატებით განახლდა",
-          details: "მონაცემები ხელახლა დაშიფრულია ახალი პაროლით. სხვა არაფერი შეცვლილა."
         });
       }
     })
@@ -5180,7 +6231,7 @@ const NAV = [
   { key: "dashboard", label: "მიმოხილვა", iconName: "dashboard" },
   { key: "cases", label: "საქმეები", iconName: "assignment" },
   { key: "incidents", label: "შემთხვევები", iconName: "task_alt" },
-  { key: "employees", label: "თანამშრომლები", iconName: "group" },
+  { key: "employees", label: "თანამშრომლების დამატება", iconName: "group" },
   { key: "employeeDetail", label: "თანამშრომლის დეტალები", iconName: "person_search" },
   { key: "categoryDetail", label: "კატეგორიის დეტალები", iconName: "folder_open" },
   { key: "settings", label: "პარამეტრები", iconName: "settings" }
@@ -5235,20 +6286,16 @@ function Sidebar({ active, setActive, open, setOpen, caseCount }) {
 
 /* ================================================================== */
 /*  BACKUP REMINDER TOAST                                          */
-/*  Small notification card shown in the bottom-right corner on every  */
-/*  page while logged in, whenever the backup is overdue. Separate     */
-/*  from the larger banner on the Settings page. It has no close       */
-/*  button by design it disappears on its own the moment a backup    */
-/*  is made (lastBackupAt updates and staleness re-evaluates).         */
-/*  Positioning/spacing use inline styles rather than Tailwind         */
-/*  utility classes, since this file ships a hand-curated CSS subset   */
-/*  (not full Tailwind) and only classes already used elsewhere in     */
-/*  the document are guaranteed to exist.                              */
+/*  Mon–Fri at/after 17:00 local. Sticky until backup is made       */
+/*  (incl. next weekday morning). Weekends hidden. No close btn.    */
 /* ================================================================== */
 
-function BackupReminderToast({ lastBackupAt, onGoToBackup }) {
-  const stale = isBackupStale(lastBackupAt);
-  if (!stale) return null;
+function BackupReminderToast({ lastBackupAt, show, onGoToBackup }) {
+  useEffect(() => {
+    if (show) markBackupReminderShownToday();
+  }, [show]);
+
+  if (!show) return null;
 
   const ageDays = daysSince(lastBackupAt);
 
@@ -5278,13 +6325,17 @@ function BackupReminderToast({ lastBackupAt, onGoToBackup }) {
         className: "text-xs font-semibold text-[#8C6B21]",
         style: { lineHeight: 1.4 }
       },
-        lastBackupAt ? `Backup ${ageDays} დღეა არ გაგიკეთებიათ` : "Backup ჯერ არასდროს გაგიკეთებიათ"
+        "დროა დღიური Backup-ისთვის"
       ),
       React.createElement("p", {
         className: "text-[11px] text-[#9A967F]",
         style: { lineHeight: 1.4, marginTop: 4 }
       },
-        "მონაცემები მხოლოდ ამ ბრაუზერშია. რეკომენდებულია რეგულარული Backup."
+        lastBackupAt
+          ? (ageDays === 0
+              ? "დღეს უკვე გქონდათ აქტივობა გთხოვთ გააკეთოთ Backup."
+              : `ბოლო Backup ${ageDays} დღის წინ. გთხოვთ, შექმნათ Backup მონაცემთა დასაცავად.`)
+          : "Backup გაკეთება მნიშვნელოვანია თქვენი მონაცემების დაცვისთვის."
       ),
       React.createElement("button", {
         onClick: onGoToBackup,
@@ -5314,6 +6365,7 @@ function QAAuditPlatform() {
   const [saveState, setSaveState] = useState("idle");
   const [loadProgress, setLoadProgress] = useState(0);
   const [lastBackupAt, setLastBackupAt] = useState(null);
+  const [showBackupReminder, setShowBackupReminder] = useState(false);
   const [storagePersisted, setStoragePersisted] = useState(null);
 
   const saveTimer = useRef(null);
@@ -5372,7 +6424,6 @@ function QAAuditPlatform() {
   const lockKeyInMemory = async (key) => {
     try {
       const locked = await toNonExtractableKey(key);
-      console.log('[v2.0] Encryption key locked in memory (non-extractable, not persisted)');
       return locked;
     } catch (err) {
       console.error('[v2.0] lockKeyInMemory failed:', err);
@@ -5484,13 +6535,27 @@ function QAAuditPlatform() {
   };
 
   const preparePasswordChange = async () => {
+    try {
+      if (saveTimer.current || isDirty() || saveInFlightRef.current) {
+        await persistNow();
+      }
+    } catch (err) {
+      console.error('[v2.0] preparePasswordChange flush failed:', err);
+    }
     cancelPendingSave();
     if (saveInFlightRef.current) {
       try { await saveInFlightRef.current; } catch (_) {}
     }
   };
 
-  const handleLogout = useCallback(() => {
+  const handleLogout = useCallback(async () => {
+    try {
+      if (saveTimer.current || isDirty() || saveInFlightRef.current) {
+        await persistNow();
+      }
+    } catch (err) {
+      console.error('[v2.0] logout flush failed:', err);
+    }
     cancelPendingSave();
     setEncryptionKey(null);
     encryptionKeyRef.current = null;
@@ -5520,7 +6585,6 @@ function QAAuditPlatform() {
     setStoragePersisted(null);
 
     try { sessionStorage.removeItem('qa_session_key'); } catch (_) {}
-    console.log('[v2.0] Platform reset completed');
   }, []);
 
   const handleRegistration = async (key, initialData, email) => {
@@ -5585,7 +6649,6 @@ function QAAuditPlatform() {
     if (data && encryptionKey) {
       const autoSaveInterval = setInterval(() => {
         if (isDirty() && encryptionKeyRef.current && dataRef.current) {
-          console.log('[v2.0] Auto-save triggered (dirty)');
           flushPendingSave();
         }
       }, 5 * 60 * 1000);
@@ -5634,7 +6697,6 @@ function QAAuditPlatform() {
       setSelectedCategory("");
 
       if (typeof window !== 'undefined' && window.gc) {
-        console.log('[v2.0] Triggering garbage collection');
         window.gc();
       }
     }
@@ -5686,6 +6748,25 @@ function QAAuditPlatform() {
     }
   }, [initState, refreshBackupStatus, requestPersist]);
 
+  useEffect(() => {
+    if (initState !== 'logged-in') {
+      setShowBackupReminder(false);
+      return;
+    }
+    const tick = () => setShowBackupReminder(shouldShowBackupReminder(lastBackupAt));
+    tick();
+    const id = setInterval(tick, 60 * 1000);
+    const onVis = () => { if (document.visibilityState === "visible") tick(); };
+    const onFocus = () => tick();
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [initState, lastBackupAt]);
+
   const goToEmployee = name => {
     setSelectedEmployee(name);
     setActive("employeeDetail");
@@ -5736,6 +6817,7 @@ function QAAuditPlatform() {
 
     React.createElement(BackupReminderToast, {
       lastBackupAt,
+      show: showBackupReminder,
       onGoToBackup: () => setActive("settings")
     }),
 
